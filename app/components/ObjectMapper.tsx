@@ -1,0 +1,1002 @@
+"use client";
+
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { DragGhost } from "./drag";
+import { type FieldHighlight, FieldTree } from "./FieldTree";
+import {
+  type FieldNode,
+  type FieldType,
+  type Json,
+  type Mapping,
+  type Path,
+  type Side,
+  addField,
+  allPaths,
+  applyMappings,
+  buildTree,
+  findNode,
+  flatten,
+  isPrefix,
+  moveField,
+  pathId,
+  pathLabel,
+  removeField,
+  renameField,
+  setArrayItemType,
+  setFieldType,
+} from "@/lib/json-tree";
+import { buildWorkbook, parseWorkbook } from "@/lib/workbook";
+import { downloadXlsx, readXlsx } from "@/lib/xlsx";
+
+const STORAGE_KEY = "object-mapper:v1";
+const HINT_KEY = "object-mapper:knows-click-to-map";
+const OUTPUT_COLLAPSED_KEY = "object-mapper:output-collapsed";
+const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
+
+const EXAMPLE: Record<Side, Json> = {
+  left: {
+    id: 1042,
+    firstName: "Ada",
+    lastName: "Lovelace",
+    email: "ada@example.com",
+    address: { street: "12 Analytical Way", city: "London", zip: "N1 9GU" },
+    orders: [
+      { orderId: "A-1", total: 19.99 },
+      { orderId: "A-2", total: 5.5 },
+    ],
+  },
+  right: {
+    customerId: "",
+    name: { first: "", last: "" },
+    contact: { email: "" },
+    shipping: { line1: "", city: "", postalCode: "" },
+    purchases: [{ ref: "", amount: 0 }],
+  },
+};
+
+interface SideState {
+  text: string;
+  data: Json | null;
+  error: string | null;
+  editingText: boolean;
+}
+
+interface Selection {
+  side: Side;
+  path: Path;
+}
+
+const emptySide = (): SideState => ({ text: "", data: null, error: null, editingText: true });
+const other = (side: Side): Side => (side === "left" ? "right" : "left");
+const newId = () => Math.random().toString(36).slice(2, 10);
+
+export default function ObjectMapper() {
+  const [sides, setSides] = useState<Record<Side, SideState>>({
+    left: emptySide(),
+    right: emptySide(),
+  });
+  const [primary, setPrimary] = useState<Side>("left");
+  const [mappings, setMappings] = useState<Mapping[]>([]);
+  const [selected, setSelected] = useState<Selection | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  // Once someone has mapped by clicking, the "now click the other side" hint is noise.
+  const [knowsClickToMap, setKnowsClickToMap] = useState(false);
+
+  const secondary = other(primary);
+
+  // ---------- persistence ----------
+  useEffect(() => {
+    try {
+      setKnowsClickToMap(localStorage.getItem(HINT_KEY) === "1");
+    } catch {
+      // storage unavailable; keep showing the hint
+    }
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        setSides({
+          left: { ...emptySide(), ...saved.sides.left, error: null },
+          right: { ...emptySide(), ...saved.sides.right, error: null },
+        });
+        setPrimary(saved.primary ?? "left");
+        setMappings(saved.mappings ?? []);
+      }
+    } catch {
+      // ignore unreadable saved state
+    }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ sides, primary, mappings }));
+    } catch {
+      // storage unavailable; the app still works without it
+    }
+  }, [sides, primary, mappings, loaded]);
+
+  // ---------- derived trees ----------
+  const trees = useMemo(
+    () => ({
+      left: sides.left.data !== null ? buildTree(sides.left.data) : null,
+      right: sides.right.data !== null ? buildTree(sides.right.data) : null,
+    }),
+    [sides.left.data, sides.right.data],
+  );
+
+  // Colors stick to a mapping, so removing one doesn't recolor the others.
+  const [colorFor, setColorFor] = useState(() => new Map<string, string>());
+  const missingColor = mappings.some((m) => !colorFor.has(m.id));
+  if (missingColor) {
+    const next = new Map<string, string>();
+    for (const m of mappings) {
+      const kept = colorFor.get(m.id);
+      if (kept) next.set(m.id, kept);
+    }
+    for (const m of mappings) {
+      if (next.has(m.id)) continue;
+      const used = new Set(next.values());
+      const free = COLORS.find((c) => !used.has(c)) ?? COLORS[next.size % COLORS.length];
+      next.set(m.id, free);
+    }
+    setColorFor(next); // adjusting state during render: React re-renders before painting
+  }
+
+  const mappedColors = useMemo(() => {
+    const result: Record<Side, Map<string, string>> = { left: new Map(), right: new Map() };
+    for (const m of mappings) {
+      const c = colorFor.get(m.id)!;
+      result.left.set(pathId(m.left), c);
+      result.right.set(pathId(m.right), c);
+    }
+    return result;
+  }, [mappings, colorFor]);
+
+  // ---------- data edits ----------
+  /** Replace a side's data and drop mappings that point at fields that no longer exist. */
+  const commitData = useCallback(
+    (side: Side, data: Json | null, rewrite?: (m: Mapping) => Mapping) => {
+      setSides((s) => ({
+        ...s,
+        [side]: { ...s[side], data, text: data === null ? s[side].text : JSON.stringify(data, null, 2) },
+      }));
+      const valid = data === null ? new Set<string>() : allPaths(buildTree(data));
+      setMappings((ms) =>
+        ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => valid.has(pathId(m[side]))),
+      );
+      setSelected((sel) => (sel && sel.side === side && !valid.has(pathId(sel.path)) ? null : sel));
+    },
+    [],
+  );
+
+  const loadText = (side: Side) => {
+    const text = sides[side].text.trim();
+    if (!text) {
+      setSides((s) => ({ ...s, [side]: { ...s[side], error: "Paste some JSON first." } }));
+      return;
+    }
+    try {
+      const data = JSON.parse(text) as Json;
+      if (typeof data !== "object" || data === null) throw new Error("Top level must be an object or array.");
+      setSides((s) => ({ ...s, [side]: { ...s[side], error: null, editingText: false } }));
+      commitData(side, data);
+    } catch (e) {
+      setSides((s) => ({ ...s, [side]: { ...s[side], error: (e as Error).message } }));
+    }
+  };
+
+  const loadExample = () => {
+    setSides({
+      left: { text: JSON.stringify(EXAMPLE.left, null, 2), data: EXAMPLE.left, error: null, editingText: false },
+      right: { text: JSON.stringify(EXAMPLE.right, null, 2), data: EXAMPLE.right, error: null, editingText: false },
+    });
+    setPrimary("left");
+    setMappings([]);
+    setSelected(null);
+  };
+
+  const resetAll = () => {
+    setSides({ left: emptySide(), right: emptySide() });
+    setMappings([]);
+    setSelected(null);
+  };
+
+  // ---------- mapping ----------
+  const createMapping = useCallback(
+    (a: Selection, b: Selection) => {
+      if (a.side === b.side) return;
+      const left = a.side === "left" ? a.path : b.path;
+      const right = a.side === "right" ? a.path : b.path;
+      if (left.length === 0 || right.length === 0) return;
+      setMappings((ms) => {
+        // Each secondary field has exactly one source; replace an existing one.
+        const target = secondary === "left" ? left : right;
+        const kept = ms.filter((m) => pathId(m[secondary]) !== pathId(target));
+        return [...kept, { id: newId(), left, right }];
+      });
+    },
+    [secondary],
+  );
+
+  const handleSelect = (side: Side, path: Path) => {
+    if (selected && selected.side !== side) {
+      createMapping(selected, { side, path });
+      setSelected(null);
+      if (!knowsClickToMap) {
+        setKnowsClickToMap(true);
+        try {
+          localStorage.setItem(HINT_KEY, "1");
+        } catch {
+          // not persisted; the hint stays hidden for this visit only
+        }
+      }
+    } else if (selected && pathId(selected.path) === pathId(path)) {
+      setSelected(null);
+    } else {
+      setSelected({ side, path });
+    }
+  };
+
+  // ---------- removing mappings (with undo) ----------
+  // What is being hovered: one line, one list row, or a field (all of its mappings).
+  const [hover, setHover] = useState<{ ids: string[]; via: "line" | "list" | "field" } | null>(null);
+  const hoveredIds = hover?.ids ?? null;
+  const [undo, setUndo] = useState<{ removed: { m: Mapping; index: number }[]; text: string } | null>(null);
+
+  const removeMappings = (ids: string[]) => {
+    const removed = mappings.flatMap((m, index) => (ids.includes(m.id) ? [{ m, index }] : []));
+    if (removed.length === 0) return;
+    setMappings((ms) => ms.filter((m) => !ids.includes(m.id)));
+    setHover(null);
+    const only = removed[0].m;
+    setUndo({
+      removed,
+      text:
+        removed.length === 1
+          ? `Removed ${pathLabel(only[primary])} → ${pathLabel(only[secondary])}`
+          : `Removed ${removed.length} mappings`,
+    });
+  };
+
+  /** Remove every mapping that uses this field. */
+  const unmapField = (side: Side, path: Path) =>
+    removeMappings(mappings.filter((m) => pathId(m[side]) === pathId(path)).map((m) => m.id));
+
+  /** Hovering a field spotlights its mappings, including those of anything inside it. */
+  const hoverField = (side: Side, path: Path | null) => {
+    if (!path) {
+      setHover((h) => (h?.via === "field" ? null : h));
+      return;
+    }
+    const ids = mappings.filter((m) => isPrefix(path, m[side])).map((m) => m.id);
+    setHover(ids.length ? { ids, via: "field" } : null);
+  };
+
+  // Fields at either end of the spotlighted mappings, with a note naming the other end.
+  const highlights = useMemo(() => {
+    const out: Record<Side, Map<string, FieldHighlight>> = { left: new Map(), right: new Map() };
+    if (!hoveredIds) return out;
+    const add = (side: Side, path: Path, color: string, note: string) => {
+      const id = pathId(path);
+      const existing = out[side].get(id);
+      out[side].set(id, existing ? { color: existing.color, note: `${existing.note}, ${note.slice(2)}` } : { color, note });
+    };
+    for (const m of mappings) {
+      if (!hoveredIds.includes(m.id)) continue;
+      const color = colorFor.get(m.id) ?? COLORS[0];
+      add(primary, m[primary], color, `→ ${pathLabel(m[secondary])}`);
+      add(secondary, m[secondary], color, `← ${pathLabel(m[primary])}`);
+    }
+    return out;
+  }, [hoveredIds, mappings, colorFor, primary, secondary]);
+
+  const undoRemove = () => {
+    if (!undo) return;
+    setMappings((ms) => {
+      const next = [...ms];
+      for (const { m, index } of undo.removed) {
+        // Skip a mapping whose target has been mapped again since.
+        if (next.some((n) => pathId(n[secondary]) === pathId(m[secondary]))) continue;
+        next.splice(Math.min(index, next.length), 0, m);
+      }
+      return next;
+    });
+    setUndo(null);
+  };
+
+  useEffect(() => {
+    if (!undo) return;
+    const t = setTimeout(() => setUndo(null), 8000);
+    return () => clearTimeout(t);
+  }, [undo]);
+
+  // Suggest key/type when adding a field on the editable side while a primary field is selected.
+  const suggestion = useMemo(() => {
+    if (!selected || selected.side !== primary) return null;
+    const tree = trees[primary];
+    const node = tree && findNode(tree, selected.path);
+    if (!node) return null;
+    const key = [...node.path].reverse().find((s) => s !== "[]") ?? "field";
+    return { key, type: node.type, itemType: node.children[0]?.type, label: pathLabel(node.path) };
+  }, [selected, primary, trees]);
+
+  const editHandlers = (side: Side) => {
+    const data = sides[side].data;
+    return {
+      onAdd: (parent: Path, key: string, type: FieldType, itemType: FieldType | undefined, mapSelected: boolean) => {
+        if (data === null) return;
+        commitData(side, addField(data, parent, key, type, itemType));
+        if (mapSelected && selected && selected.side !== side) {
+          createMapping(selected, { side, path: [...parent, key] });
+          setSelected(null);
+        }
+      },
+      onRemove: (path: Path) => {
+        if (data !== null) commitData(side, removeField(data, path));
+      },
+      onRename: (path: Path, newKey: string) => {
+        if (data === null) return;
+        const renamed = [...path.slice(0, -1), newKey];
+        commitData(side, renameField(data, path, newKey), (m) =>
+          isPrefix(path, m[side])
+            ? { ...m, [side]: [...renamed, ...m[side].slice(path.length)] }
+            : m,
+        );
+      },
+      onRetype: (path: Path, type: FieldType) => {
+        if (data !== null) commitData(side, setFieldType(data, path, type));
+      },
+      onSetItemType: (path: Path, itemType: FieldType) => {
+        if (data !== null) commitData(side, setArrayItemType(data, path, itemType));
+      },
+      onMoveField: (from: Path, parent: Path, after?: string) => {
+        if (data === null) return;
+        const moved = moveField(data, from, parent, after);
+        if ("error" in moved) {
+          setNotice({ kind: "error", text: `Couldn't move that field: ${moved.error}`, details: [] });
+          return;
+        }
+        setNotice(null);
+        // Mappings to the field (or anything inside it) follow it to its new place.
+        commitData(side, moved.data, (m) =>
+          isPrefix(from, m[side])
+            ? { ...m, [side]: [...moved.path, ...m[side].slice(from.length)] }
+            : m,
+        );
+      },
+    };
+  };
+
+  // ---------- output ----------
+  const primaryTree = trees[primary];
+  const secondaryTree = trees[secondary];
+  const result = useMemo(() => {
+    const src = sides[primary].data;
+    const tpl = sides[secondary].data;
+    if (src === null || tpl === null) return null;
+    return applyMappings(
+      src,
+      tpl,
+      mappings.map((m) => ({ from: m[primary], to: m[secondary] })),
+    );
+  }, [sides, primary, secondary, mappings]);
+
+  const exportExcel = () =>
+    downloadXlsx(
+      "object-mapping.xlsx",
+      buildWorkbook({
+        primary,
+        data: { left: sides.left.data, right: sides.right.data },
+        mappings,
+        result,
+      }),
+    );
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string; details: string[] } | null>(
+    null,
+  );
+
+  const importExcel = async (file: File) => {
+    try {
+      const imported = parseWorkbook(await readXlsx(await file.arrayBuffer()));
+      const hasWork = sides.left.data !== null || sides.right.data !== null || mappings.length > 0;
+      if (hasWork && !window.confirm(`Replace the current objects and mappings with "${file.name}"?`)) return;
+      const sideFrom = (data: Json): SideState => ({
+        text: JSON.stringify(data, null, 2),
+        data,
+        error: null,
+        editingText: false,
+      });
+      setSides({ left: sideFrom(imported.data.left), right: sideFrom(imported.data.right) });
+      setPrimary(imported.primary);
+      setMappings(imported.mappings.map((m) => ({ ...m, id: newId() })));
+      setSelected(null);
+      const n = imported.mappings.length;
+      setNotice({
+        kind: "ok",
+        text: `Imported "${file.name}": ${n} mapping${n === 1 ? "" : "s"}, ${imported.primary} side is primary.`,
+        details: imported.warnings,
+      });
+    } catch (e) {
+      setNotice({ kind: "error", text: `Couldn't import "${file.name}": ${(e as Error).message}`, details: [] });
+    }
+  };
+
+  const mappingSpec = useMemo(
+    () =>
+      mappings.map((m) => ({
+        from: pathLabel(m[primary]),
+        to: pathLabel(m[secondary]),
+      })),
+    [mappings, primary, secondary],
+  );
+
+  // ---------- connector lines ----------
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const panelRefs = { left: useRef<HTMLDivElement>(null), right: useRef<HTMLDivElement>(null) };
+  const [lines, setLines] = useState<
+    { id: string; d: string; mx: number; my: number; color: string; x2: number; y2: number; dir: Side }[]
+  >([]);
+  const [layoutTick, setLayoutTick] = useState(0);
+  const bump = useCallback(() => setLayoutTick((t) => t + 1), []);
+
+  useEffect(() => {
+    window.addEventListener("resize", bump);
+    const ro = new ResizeObserver(bump);
+    const panels = [panelRefs.left.current, panelRefs.right.current].filter(Boolean) as HTMLElement[];
+    panels.forEach((p) => {
+      ro.observe(p);
+      p.addEventListener("scroll", bump, { passive: true });
+      // Expanding/collapsing rows changes layout without resizing the scroll box.
+      if (p.firstElementChild) ro.observe(p.firstElementChild);
+    });
+    return () => {
+      window.removeEventListener("resize", bump);
+      ro.disconnect();
+      panels.forEach((p) => p.removeEventListener("scroll", bump));
+    };
+    // panelRefs are stable; re-run when panels mount/unmount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bump, sides.left.editingText, sides.right.editingText, trees.left === null, trees.right === null]);
+
+  useLayoutEffect(() => {
+    const ws = workspaceRef.current;
+    const lp = panelRefs.left.current;
+    const rp = panelRefs.right.current;
+    if (!ws || !lp || !rp || window.innerWidth < 1024) {
+      setLines([]);
+      return;
+    }
+    const wsBox = ws.getBoundingClientRect();
+    const lBox = lp.getBoundingClientRect();
+    const rBox = rp.getBoundingClientRect();
+
+    const rowY = (side: Side, path: Path, box: DOMRect) => {
+      // Fall back to the nearest visible ancestor when a row is collapsed.
+      for (let n = path.length; n > 0; n--) {
+        const el = (side === "left" ? lp : rp).querySelector<HTMLElement>(
+          `[data-pid="${CSS.escape(pathId(path.slice(0, n)))}"]`,
+        );
+        if (el) {
+          const r = el.getBoundingClientRect();
+          const y = r.top + r.height / 2;
+          return Math.min(Math.max(y, box.top + 4), box.bottom - 4) - wsBox.top;
+        }
+      }
+      return null;
+    };
+
+    const x1 = lBox.right - wsBox.left;
+    const x2 = rBox.left - wsBox.left;
+    const next = [];
+    for (const m of mappings) {
+      const y1 = rowY("left", m.left, lBox);
+      const y2 = rowY("right", m.right, rBox);
+      if (y1 === null || y2 === null) continue;
+      const mid = (x1 + x2) / 2;
+      next.push({
+        id: m.id,
+        d: `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`,
+        // The curve is symmetric, so its midpoint is the midpoint of its ends.
+        mx: mid,
+        my: (y1 + y2) / 2,
+        color: colorFor.get(m.id)!,
+        x2: primary === "left" ? x2 : x1,
+        y2: primary === "left" ? y2 : y1,
+        dir: primary === "left" ? ("right" as Side) : ("left" as Side),
+      });
+    }
+    setLines(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mappings, trees, layoutTick, colorFor, primary]);
+
+  // ---------- render ----------
+  const renderPanel = (side: Side) => {
+    const state = sides[side];
+    const tree = trees[side];
+    const isPrimary = side === primary;
+    const showTree = tree && !state.editingText;
+
+    return (
+      <section className="flex min-w-0 flex-col rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+        <header className="flex flex-wrap items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+          <h2 className="text-sm font-semibold capitalize">{side} object</h2>
+          {isPrimary ? (
+            <span className="rounded-full bg-blue-600 px-2 py-0.5 text-xs font-medium text-white">
+              🔒 Primary · source
+            </span>
+          ) : (
+            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+              ✎ Editable · target
+            </span>
+          )}
+          <div className="ml-auto flex gap-1">
+            {!isPrimary && (
+              <HeaderButton onClick={() => setPrimary(side)}>Make primary</HeaderButton>
+            )}
+            {showTree && (
+              <HeaderButton
+                onClick={() => setSides((s) => ({ ...s, [side]: { ...s[side], editingText: true } }))}
+              >
+                {isPrimary ? "Replace JSON" : "Edit JSON"}
+              </HeaderButton>
+            )}
+          </div>
+        </header>
+
+        {showTree ? (
+          <div ref={panelRefs[side]} data-drag-scroll className="max-h-[65vh] min-h-64 overflow-auto p-2">
+            <div>
+              <FieldTree
+                root={tree as FieldNode}
+                side={side}
+                editable={!isPrimary}
+                selectedId={selected?.side === side ? pathId(selected.path) : null}
+                mappedColors={mappedColors[side]}
+                suggestion={isPrimary ? null : suggestion}
+                onSelect={(path) => handleSelect(side, path)}
+                onDropField={(path, from) => createMapping(from, { side, path })}
+                onUnmap={(path) => unmapField(side, path)}
+                highlights={highlights[side]}
+                onHoverField={(path) => hoverField(side, path)}
+                {...editHandlers(side)}
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-1 flex-col gap-2 p-3">
+            <textarea
+              value={state.text}
+              onChange={(e) =>
+                setSides((s) => ({ ...s, [side]: { ...s[side], text: e.target.value, error: null } }))
+              }
+              placeholder={`Paste the ${isPrimary ? "primary (source)" : "target"} JSON object here…`}
+              spellCheck={false}
+              className="min-h-64 flex-1 resize-y rounded-md border border-zinc-300 bg-zinc-50 p-2 font-mono text-xs outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-950"
+            />
+            {state.error && <p className="text-xs text-red-600 dark:text-red-400">{state.error}</p>}
+            <div className="flex gap-2">
+              <button
+                onClick={() => loadText(side)}
+                className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                Load
+              </button>
+              {tree && (
+                <button
+                  onClick={() => setSides((s) => ({ ...s, [side]: { ...s[side], editingText: false, error: null } }))}
+                  className="rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+            {!isPrimary && (
+              <p className="text-xs text-zinc-500">
+                Tip: paste <code>{"{}"}</code> to start the target from scratch and build it field by field.
+              </p>
+            )}
+          </div>
+        )}
+      </section>
+    );
+  };
+
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-6">
+      <div className="flex flex-wrap items-end gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Object Mapper</h1>
+          <p className="text-sm text-zinc-500">
+            Click a field on one side, then a field on the other (or drag between them) to map it.
+            Drag fields within the editable side to move them into objects or lists.
+            Values flow from the 🔒 primary object into the editable one.
+          </p>
+        </div>
+        <div className="ml-auto flex gap-2">
+          <HeaderButton onClick={() => setPrimary(secondary)}>⇄ Swap primary</HeaderButton>
+          <HeaderButton
+            onClick={exportExcel}
+            disabled={sides.left.data === null && sides.right.data === null}
+          >
+            ⬇ Export to Excel
+          </HeaderButton>
+          <HeaderButton onClick={() => fileInputRef.current?.click()}>⬆ Import Excel</HeaderButton>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = ""; // allow re-importing the same file
+              if (file) importExcel(file);
+            }}
+          />
+          <HeaderButton onClick={loadExample}>Load example</HeaderButton>
+          <HeaderButton onClick={resetAll}>Clear</HeaderButton>
+        </div>
+      </div>
+
+      {notice && (
+        <div
+          className={`rounded-md border px-3 py-2 text-sm ${
+            notice.kind === "error"
+              ? "border-red-200 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+              : notice.details.length
+                ? "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+                : "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200"
+          }`}
+        >
+          <div className="flex items-start gap-2">
+            <p className="flex-1">
+              {notice.text}
+              {notice.details.length > 0 &&
+                ` ${notice.details.length} row${notice.details.length === 1 ? " was" : "s were"} skipped:`}
+            </p>
+            <button className="opacity-60 hover:opacity-100" onClick={() => setNotice(null)} aria-label="Dismiss">
+              ×
+            </button>
+          </div>
+          {notice.details.length > 0 && (
+            <ul className="mt-1 list-disc pl-5 text-xs">
+              {notice.details.map((d) => (
+                <li key={d}>{d}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {selected && !knowsClickToMap && (
+        <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950 dark:text-blue-200">
+          Selected <code className="font-semibold">{pathLabel(selected.path)}</code> on the {selected.side}.
+          Now click a field on the {other(selected.side)} side to map it
+          {selected.side === primary && ", or use + on the target to create a new mapped field"}.{" "}
+          <button className="underline" onClick={() => setSelected(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      <div ref={workspaceRef} className="relative grid grid-cols-1 gap-4 lg:grid-cols-[1fr_72px_1fr] lg:gap-0">
+        {renderPanel("left")}
+        <div className="hidden items-start justify-center pt-3 text-xl text-zinc-400 lg:flex" aria-hidden>
+          {primary === "left" ? "→" : "←"}
+        </div>
+        {renderPanel("right")}
+        <svg className="pointer-events-none absolute inset-0 hidden h-full w-full overflow-visible lg:block">
+          {lines.map((l) => {
+            const active = hoveredIds?.includes(l.id) ?? false;
+            const dimmed = hoveredIds !== null && !active;
+            return (
+              <g
+                key={l.id}
+                onMouseEnter={() => setHover({ ids: [l.id], via: "line" })}
+                onMouseLeave={() => setHover(null)}
+              >
+                {/* Wide invisible stroke so the thin line is easy to hover. */}
+                <path d={l.d} fill="none" stroke="transparent" strokeWidth={14} style={{ pointerEvents: "stroke" }} />
+                <path
+                  d={l.d}
+                  fill="none"
+                  stroke={l.color}
+                  strokeWidth={active ? 3.5 : 2}
+                  strokeOpacity={dimmed ? 0.12 : 0.85}
+                />
+                <path
+                  d={
+                    l.dir === "right"
+                      ? `M ${l.x2 - 7} ${l.y2 - 4} L ${l.x2} ${l.y2} L ${l.x2 - 7} ${l.y2 + 4}`
+                      : `M ${l.x2 + 7} ${l.y2 - 4} L ${l.x2} ${l.y2} L ${l.x2 + 7} ${l.y2 + 4}`
+                  }
+                  fill="none"
+                  stroke={l.color}
+                  strokeOpacity={dimmed ? 0.12 : 1}
+                  strokeWidth={2}
+                />
+                {active && hover?.via === "line" && (
+                  <g
+                    role="button"
+                    aria-label="Remove mapping"
+                    data-remove-mapping={l.id}
+                    style={{ pointerEvents: "auto", cursor: "pointer" }}
+                    onClick={() => removeMappings([l.id])}
+                  >
+                    <title>Remove mapping</title>
+                    <circle cx={l.mx} cy={l.my} r={10} fill={l.color} stroke="white" strokeWidth={2} />
+                    <path
+                      d={`M ${l.mx - 3.5} ${l.my - 3.5} L ${l.mx + 3.5} ${l.my + 3.5} M ${l.mx + 3.5} ${l.my - 3.5} L ${l.mx - 3.5} ${l.my + 3.5}`}
+                      stroke="white"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                    />
+                  </g>
+                )}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+
+      <DragGhost />
+
+      <OutputPanel
+        mappings={mappings}
+        primary={primary}
+        colorFor={colorFor}
+        primaryTree={primaryTree}
+        secondaryTree={secondaryTree}
+        mappingSpec={mappingSpec}
+        result={result}
+        hoveredIds={hoveredIds}
+        onHover={(id) => setHover(id ? { ids: [id], via: "list" } : null)}
+        onRemove={(id) => removeMappings([id])}
+        onClear={() => removeMappings(mappings.map((m) => m.id))}
+      />
+
+      {undo && (
+        <div
+          role="status"
+          className="fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-lg bg-zinc-900 px-4 py-2 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900"
+        >
+          <span className="font-mono text-xs">{undo.text}</span>
+          <button onClick={undoRemove} className="font-semibold text-blue-300 hover:underline dark:text-blue-700">
+            Undo
+          </button>
+          <button onClick={() => setUndo(null)} aria-label="Dismiss" className="opacity-60 hover:opacity-100">
+            ×
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A boolean remembered in this browser. Rendered as false on the server so
+// hydration matches; falls back to in-memory state when storage is blocked.
+const flagListeners = new Set<() => void>();
+const memoryFlags = new Map<string, boolean>();
+function readFlag(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch {
+    return memoryFlags.get(key) ?? false;
+  }
+}
+function useStoredFlag(key: string): [boolean, (next: boolean) => void] {
+  const value = useSyncExternalStore(
+    (listener) => {
+      flagListeners.add(listener);
+      window.addEventListener("storage", listener);
+      return () => {
+        flagListeners.delete(listener);
+        window.removeEventListener("storage", listener);
+      };
+    },
+    () => readFlag(key),
+    () => false,
+  );
+  const set = (next: boolean) => {
+    memoryFlags.set(key, next);
+    try {
+      localStorage.setItem(key, next ? "1" : "0");
+    } catch {
+      // not persisted; the in-memory value still applies for this visit
+    }
+    flagListeners.forEach((l) => l());
+  };
+  return [value, set];
+}
+
+function HeaderButton({
+  children,
+  onClick,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+    >
+      {children}
+    </button>
+  );
+}
+
+type Tab = "mappings" | "result" | "flat" | "spec";
+
+function OutputPanel({
+  mappings,
+  primary,
+  colorFor,
+  primaryTree,
+  secondaryTree,
+  mappingSpec,
+  result,
+  hoveredIds,
+  onHover,
+  onRemove,
+  onClear,
+}: {
+  mappings: Mapping[];
+  primary: Side;
+  colorFor: Map<string, string>;
+  primaryTree: FieldNode | null;
+  secondaryTree: FieldNode | null;
+  mappingSpec: { from: string; to: string }[];
+  result: Json | null;
+  hoveredIds: string[] | null;
+  onHover: (id: string | null) => void;
+  onRemove: (id: string) => void;
+  onClear: () => void;
+}) {
+  const [tab, setTab] = useState<Tab>("mappings");
+  const [copied, setCopied] = useState(false);
+  const [collapsed, toggleCollapsed] = useStoredFlag(OUTPUT_COLLAPSED_KEY);
+  const secondary = other(primary);
+
+  const texts: Record<Exclude<Tab, "mappings">, string | null> = {
+    result: result === null ? null : JSON.stringify(result, null, 2),
+    flat: result === null ? null : JSON.stringify(flatten(result), null, 2),
+    spec: JSON.stringify(mappingSpec, null, 2),
+  };
+  const copyText = tab === "mappings" ? null : texts[tab];
+
+  const copy = async () => {
+    if (!copyText) return;
+    try {
+      await navigator.clipboard.writeText(copyText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // clipboard blocked; nothing else to do
+    }
+  };
+
+  const tabs: [Tab, string][] = [
+    ["mappings", `Mappings (${mappings.length})`],
+    ["result", "Mapped result"],
+    ["flat", "Flattened JSON"],
+    ["spec", "Mapping JSON"],
+  ];
+
+  return (
+    <section className="rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+      <header
+        className={`flex items-center gap-1 px-2 pt-2 ${
+          collapsed ? "pb-2" : "border-b border-zinc-200 dark:border-zinc-800"
+        }`}
+      >
+        <button
+          onClick={() => toggleCollapsed(!collapsed)}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? "Show output panel" : "Hide output panel"}
+          title={collapsed ? "Show" : "Hide"}
+          className={`flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 ${
+            collapsed ? "" : "-mb-px"
+          }`}
+        >
+          <span className={`text-xs transition-transform ${collapsed ? "-rotate-90" : ""}`}>▾</span>
+        </button>
+        {tabs.map(([t, label]) => (
+          <button
+            key={t}
+            onClick={() => {
+              setTab(t);
+              if (collapsed) toggleCollapsed(false); // a tab click while collapsed opens that tab
+            }}
+            className={`border-b-2 px-3 py-1.5 text-sm ${collapsed ? "" : "-mb-px"} ${
+              tab === t && !collapsed
+                ? "border-blue-600 font-medium text-zinc-900 dark:text-zinc-100"
+                : "border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+        {!collapsed && (
+          <div className="ml-auto pb-1">
+            {copyText && <HeaderButton onClick={copy}>{copied ? "Copied!" : "Copy"}</HeaderButton>}
+            {tab === "mappings" && mappings.length > 0 && <HeaderButton onClick={onClear}>Remove all</HeaderButton>}
+          </div>
+        )}
+      </header>
+
+      <div className={collapsed ? "hidden" : "p-3"}>
+        {tab === "mappings" &&
+          (mappings.length === 0 ? (
+            <p className="text-sm text-zinc-500">No mappings yet.</p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {mappings.map((m) => {
+                const from = m[primary];
+                const to = m[secondary];
+                const fromType = primaryTree && findNode(primaryTree, from)?.type;
+                const toType = secondaryTree && findNode(secondaryTree, to)?.type;
+                const mismatch = fromType && toType && fromType !== toType;
+                return (
+                  <li
+                    key={m.id}
+                    onMouseEnter={() => onHover(m.id)}
+                    onMouseLeave={() => onHover(null)}
+                    className={`group flex items-center gap-2 rounded-md px-2 py-1 font-mono text-sm ${
+                      hoveredIds?.includes(m.id) ? "bg-zinc-100 dark:bg-zinc-800" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/60"
+                    }`}
+                  >
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: colorFor.get(m.id) }} />
+                    <span className="text-zinc-500">{primary}.</span>
+                    <span>{pathLabel(from)}</span>
+                    <span className="text-zinc-400">→</span>
+                    <span className="text-zinc-500">{secondary}.</span>
+                    <span>{pathLabel(to)}</span>
+                    {mismatch && (
+                      <span
+                        className="rounded bg-amber-100 px-1.5 font-sans text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                        title="The source and target types differ; the source value is copied as-is."
+                      >
+                        {fromType} → {toType}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => onRemove(m.id)}
+                      className="ml-auto flex items-center gap-1 rounded-md border border-transparent px-2 py-0.5 font-sans text-xs text-zinc-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 dark:hover:border-red-900 dark:hover:bg-red-950 dark:hover:text-red-300"
+                      title="Remove mapping"
+                    >
+                      <span aria-hidden>×</span> Remove
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          ))}
+
+        {tab !== "mappings" && (
+          <pre className="max-h-96 overflow-auto rounded-md bg-zinc-50 p-3 font-mono text-xs dark:bg-zinc-950">
+            {texts[tab] ?? "Load both objects to see the mapped result."}
+          </pre>
+        )}
+        {tab === "result" && result !== null && (
+          <p className="mt-2 text-xs text-zinc-500">
+            The {secondary} object with every mapped field filled from the {primary} object. Unmapped
+            fields keep their current values.
+          </p>
+        )}
+        {tab === "flat" && result !== null && (
+          <p className="mt-2 text-xs text-zinc-500">
+            The mapped result as one flat object: nested keys become paths like{" "}
+            <code>a.b[0].c</code>. This is what goes into the Excel export.
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}

@@ -1,11 +1,13 @@
 "use client";
 
 import { useState } from "react";
+import { ArrayExamples } from "./ArrayExamples";
 import { type Drag, type DropIntent, type DropKind, beginDrag, useDropZone, useIsDragSource } from "./drag";
 import {
   ARRAY_ITEM,
   type FieldNode,
   type FieldType,
+  type Json,
   type Path,
   type Side,
   isPrefix,
@@ -59,6 +61,10 @@ export interface FieldTreeProps {
   highlights: Map<string, FieldHighlight>;
   /** Hovering a field (null when the pointer leaves it). */
   onHoverField: (path: Path | null) => void;
+  /** Replace a list's example items. */
+  onSetArrayItems: (arrayPath: Path, items: Json[]) => void;
+  /** Change a field's example value. */
+  onSetValue: (path: Path, value: Json) => void;
 }
 
 const TYPE_STYLES: Record<FieldType, string> = {
@@ -303,9 +309,16 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
         )}
         {node.type === "array" && <ArrayOf {...props} node={node} />}
 
-        {node.sample !== undefined && (
-          <span className="truncate text-xs text-zinc-400">{JSON.stringify(node.sample)}</span>
-        )}
+        {node.sample !== undefined &&
+          (editable && node.type !== "null" && !isItem ? (
+            <ValueEditor
+              value={node.sample}
+              type={node.type}
+              onChange={(v) => props.onSetValue(node.path, v)}
+            />
+          ) : (
+            <span className="truncate text-xs text-zinc-400">{JSON.stringify(node.sample)}</span>
+          ))}
 
         <span className="ml-auto flex items-center gap-1">
           {drop && <DropLabel text={drop.label} />}
@@ -347,6 +360,14 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
         </span>
       </div>
 
+      {open && node.type === "array" && (
+        <ArrayExamples
+          node={node}
+          editable={editable}
+          indent={8 + (depth + 1) * INDENT + 22}
+          onSetArrayItems={props.onSetArrayItems}
+        />
+      )}
       {open && <Children {...props} node={node} depth={depth + 1} />}
     </div>
   );
@@ -607,5 +628,71 @@ function AddFieldForm({
       </button>
       {clash && <span className="w-full text-red-600 dark:text-red-400">A field with that name already exists here.</span>}
     </div>
+  );
+}
+
+/** A field's example value: click to edit (booleans flip on click). */
+function ValueEditor({ value, type, onChange }: { value: Json; type: FieldType; onChange: (v: Json) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const shown = JSON.stringify(value);
+  const valueClass =
+    "max-w-56 truncate rounded px-1 text-left font-mono text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-100";
+
+  if (type === "boolean") {
+    return (
+      <button
+        className={valueClass}
+        title="Click to flip"
+        onClick={(e) => {
+          e.stopPropagation();
+          onChange(!value);
+        }}
+      >
+        {shown}
+      </button>
+    );
+  }
+
+  if (!editing) {
+    return (
+      <button
+        className={`${valueClass} ${value === "" ? "italic text-zinc-400" : ""}`}
+        title="Click to edit the example value"
+        onClick={(e) => {
+          e.stopPropagation();
+          setDraft(typeof value === "string" ? value : String(value));
+          setEditing(true);
+        }}
+      >
+        {value === "" ? "add value" : shown}
+      </button>
+    );
+  }
+
+  const invalid = type === "number" && (draft.trim() === "" || Number.isNaN(Number(draft)));
+  const commit = () => {
+    setEditing(false);
+    if (invalid) return;
+    const next = type === "number" ? Number(draft) : draft;
+    if (next !== value) onChange(next);
+  };
+  return (
+    <input
+      autoFocus
+      value={draft}
+      inputMode={type === "number" ? "decimal" : undefined}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") setEditing(false);
+      }}
+      aria-label="Example value"
+      className={`w-44 rounded border bg-white px-1 font-mono text-xs outline-none dark:bg-zinc-900 ${
+        invalid ? "border-red-500" : "border-blue-500"
+      }`}
+    />
   );
 }

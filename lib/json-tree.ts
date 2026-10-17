@@ -27,6 +27,7 @@ export interface FieldNode {
   path: Path;
   type: FieldType;
   sample?: Json; // example value for leaves
+  items?: Json[]; // an array's actual items (its example values)
   children: FieldNode[];
 }
 
@@ -92,6 +93,7 @@ export function buildTree(value: Json, key = "", path: Path = []): FieldNode {
   } else if (type === "array") {
     const shape = mergeShapes(value as Json[]);
     if (shape !== undefined) node.children = [buildTree(shape, ARRAY_ITEM, [...path, ARRAY_ITEM])];
+    node.items = value as Json[];
   } else {
     node.sample = value;
   }
@@ -145,6 +147,21 @@ export function addField(
 }
 
 /** Set what an array holds; an empty array gets one item so its shape is visible. */
+/** Replace the items of the array at `path` (in every enclosing array item). */
+export function setArrayItems(root: Json, path: Path, items: Json[]): Json {
+  return updateAt(root, path, (target) => (Array.isArray(target) ? structuredClone(items) : target));
+}
+
+/**
+ * The example values of a list, ignoring the single blank placeholder item a
+ * list gets when its item type is chosen (e.g. [""] or [0]).
+ */
+export function exampleItems(items: Json[] | undefined): Json[] {
+  if (!items) return [];
+  if (items.length === 1 && typeof items[0] !== "object" && items[0] === defaultFor(typeOf(items[0]))) return [];
+  return items;
+}
+
 export function setArrayItemType(root: Json, path: Path, itemType: FieldType): Json {
   return updateAt(root, path, (target) => {
     if (!Array.isArray(target)) return target;
@@ -425,4 +442,19 @@ export function moveField(root: Json, from: Path, parent: Path, after?: string):
     ? updateAt(data, parent, () => [{ [key]: value }])
     : updateAt(data, container, (obj) => (isObject(obj) ? insertKey(obj, key, value, after) : obj));
   return { data, path: [...container, key] };
+}
+
+/**
+ * Set the value at `path`. Inside arrays this edits the first item (the one
+ * the tree shows as the example), leaving the other items alone.
+ */
+export function setValueAt(root: Json, path: Path, value: Json): Json {
+  if (path.length === 0) return value;
+  const [head, ...rest] = path;
+  if (head === ARRAY_ITEM) {
+    if (!Array.isArray(root) || root.length === 0) return root;
+    return [setValueAt(root[0], rest, value), ...root.slice(1)];
+  }
+  if (!isObject(root) || !(head in root)) return root;
+  return { ...root, [head]: setValueAt(root[head], rest, value) };
 }

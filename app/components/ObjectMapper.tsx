@@ -23,7 +23,9 @@ import {
   removeField,
   renameField,
   setArrayItemType,
+  setArrayItems,
   setFieldType,
+  setValueAt,
 } from "@/lib/json-tree";
 import { buildWorkbook, parseWorkbook } from "@/lib/workbook";
 import { downloadXlsx, readXlsx } from "@/lib/xlsx";
@@ -347,6 +349,12 @@ export default function ObjectMapper() {
       },
       onRetype: (path: Path, type: FieldType) => {
         if (data !== null) commitData(side, setFieldType(data, path, type));
+      },
+      onSetValue: (path: Path, value: Json) => {
+        if (data !== null) commitData(side, setValueAt(data, path, value));
+      },
+      onSetArrayItems: (path: Path, items: Json[]) => {
+        if (data !== null) commitData(side, setArrayItems(data, path, items));
       },
       onSetItemType: (path: Path, itemType: FieldType) => {
         if (data !== null) commitData(side, setArrayItemType(data, path, itemType));

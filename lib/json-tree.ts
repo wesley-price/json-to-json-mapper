@@ -235,9 +235,14 @@ function assign(
   const [head, ...rest] = path;
   if (head === ARRAY_ITEM) {
     const arr = Array.isArray(root) ? [...root] : [];
-    // Without a matching source index (e.g. scalar -> array), write element 0.
-    const [i = 0, ...more] = indexes;
     const template = templates.get(pathId(at)) ?? {};
+    if (indexes.length === 0) {
+      // A single value mapped into a list field goes into every item
+      // (e.g. an order number repeated on each CSV row).
+      if (arr.length === 0) arr.push(structuredClone(template));
+      return arr.map((item) => assign(item, rest, [], value, templates, [...at, ARRAY_ITEM]));
+    }
+    const [i, ...more] = indexes;
     while (arr.length <= i) arr.push(structuredClone(template));
     arr[i] = assign(arr[i], rest, more, value, templates, [...at, ARRAY_ITEM]);
     return arr;
@@ -280,7 +285,11 @@ export function applyMappings(
       else templates.set(outerId, cleared);
     });
   }
-  for (const { from, to } of mappings) {
+  // Fill lists from list mappings first, so single values copied into every
+  // item land on all of the items rather than on a lone placeholder.
+  const depth = (p: Path) => p.filter((seg) => seg === ARRAY_ITEM).length;
+  const ordered = [...mappings].sort((a, b) => Number(depth(a.to) > depth(a.from)) - Number(depth(b.to) > depth(b.from)));
+  for (const { from, to } of ordered) {
     for (const { indexes, value } of collect(source, from)) {
       result = assign(result, to, indexes, value, templates);
     }

@@ -6,6 +6,7 @@
 //   2. "Mappings"        # | Source (<side>) | Target (<side>) | Source type | Target type
 //   3. "Primary (<side>)" Field | Value | Type  (flattened primary object)
 //   4. "Target (<side>)"  Field | Value | Type  (flattened editable object)
+//   5. "Formats"         Side | Format | Flat layout (JSON)   (optional; older workbooks are JSON)
 
 import {
   type Json,
@@ -21,7 +22,10 @@ import {
   pathLabel,
   unflatten,
 } from "./json-tree";
+import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
 import type { Cell, Sheet } from "./xlsx";
+
+export type SideFormats = Record<Side, { format: Format; layout: FlatLayout }>;
 
 const other = (side: Side): Side => (side === "left" ? "right" : "left");
 
@@ -47,8 +51,9 @@ export function buildWorkbook(opts: {
   data: Record<Side, Json | null>;
   mappings: Mapping[];
   result: Json | null;
+  formats: SideFormats;
 }): Sheet[] {
-  const { primary, data, mappings, result } = opts;
+  const { primary, data, mappings, result, formats } = opts;
   const secondary = other(primary);
   const trees = {
     left: data.left === null ? null : buildTree(data.left),
@@ -75,6 +80,17 @@ export function buildWorkbook(opts: {
     },
     flatSheet(`Primary (${primary})`, data[primary]),
     flatSheet(`Target (${secondary})`, data[secondary]),
+    {
+      name: "Formats",
+      rows: [
+        ["Side", "Format", "Flat layout (JSON)"],
+        ...(["left", "right"] as const).map((side): Cell[] => [
+          side,
+          formats[side].format,
+          formats[side].format === "flat" ? JSON.stringify(formats[side].layout) : "",
+        ]),
+      ],
+    },
   ];
 }
 
@@ -84,6 +100,7 @@ export interface ImportedWorkbook {
   primary: Side;
   data: Record<Side, Json>;
   mappings: Omit<Mapping, "id">[];
+  formats: SideFormats;
   /** Human-readable notes about anything that was skipped. */
   warnings: string[];
 }
@@ -186,5 +203,34 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
     }
   });
 
-  return { primary, data, mappings, warnings };
+  return { primary, data, mappings, formats: readFormats(sheets, warnings), warnings };
+}
+
+/** Each side's file format; a workbook without a Formats sheet is all JSON. */
+function readFormats(sheets: Sheet[], warnings: string[]): SideFormats {
+  const formats: SideFormats = {
+    left: { format: "json", layout: defaultFlatLayout() },
+    right: { format: "json", layout: defaultFlatLayout() },
+  };
+  const sheet = sheets.find((s) => s.name.toLowerCase().startsWith("formats"));
+  if (!sheet) return formats;
+  for (const row of sheet.rows.slice(1)) {
+    const side = String(row[0] ?? "").trim().toLowerCase();
+    const format = String(row[1] ?? "").trim().toLowerCase();
+    if (side !== "left" && side !== "right") continue;
+    if (!FORMATS.some((f) => f.id === format)) {
+      warnings.push(`Formats: "${row[1]}" isn't a known format; using JSON for the ${side} side.`);
+      continue;
+    }
+    let layout = defaultFlatLayout();
+    if (format === "flat" && row[2]) {
+      try {
+        layout = { ...layout, ...(JSON.parse(String(row[2])) as Partial<FlatLayout>) };
+      } catch {
+        warnings.push(`Formats: the ${side} flat layout couldn't be read; using the default layout.`);
+      }
+    }
+    formats[side] = { format: format as Format, layout };
+  }
+  return formats;
 }

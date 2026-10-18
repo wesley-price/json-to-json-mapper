@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { DragGhost } from "./drag";
+import { FlatLayoutEditor } from "./FlatLayoutEditor";
+import { AppMenu } from "./AppMenu";
 import { type FieldHighlight, FieldTree } from "./FieldTree";
 import {
   type FieldNode,
@@ -27,6 +29,18 @@ import {
   setFieldType,
   setValueAt,
 } from "@/lib/json-tree";
+import {
+  type FlatLayout,
+  type Format,
+  FORMATS,
+  PLACEHOLDERS,
+  defaultFlatLayout,
+  formatInfo,
+  readFormat,
+  writeFormat,
+} from "@/lib/formats";
+import { SECTIONS, type SectionName, guessDelimiter, syncLayoutFields } from "@/lib/formats/flat";
+import { EXAMPLES } from "@/lib/examples";
 import { buildWorkbook, parseWorkbook } from "@/lib/workbook";
 import { downloadXlsx, readXlsx } from "@/lib/xlsx";
 
@@ -35,32 +49,15 @@ const HINT_KEY = "object-mapper:knows-click-to-map";
 const OUTPUT_COLLAPSED_KEY = "object-mapper:output-collapsed";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
 
-const EXAMPLE: Record<Side, Json> = {
-  left: {
-    id: 1042,
-    firstName: "Ada",
-    lastName: "Lovelace",
-    email: "ada@example.com",
-    address: { street: "12 Analytical Way", city: "London", zip: "N1 9GU" },
-    orders: [
-      { orderId: "A-1", total: 19.99 },
-      { orderId: "A-2", total: 5.5 },
-    ],
-  },
-  right: {
-    customerId: "",
-    name: { first: "", last: "" },
-    contact: { email: "" },
-    shipping: { line1: "", city: "", postalCode: "" },
-    purchases: [{ ref: "", amount: 0 }],
-  },
-};
-
 interface SideState {
+  /** The file as text, in this side's format. */
   text: string;
   data: Json | null;
   error: string | null;
   editingText: boolean;
+  format: Format;
+  /** How a flat file is laid out (only used when format is "flat"). */
+  layout: FlatLayout;
 }
 
 interface Selection {
@@ -68,7 +65,26 @@ interface Selection {
   path: Path;
 }
 
-const emptySide = (): SideState => ({ text: "", data: null, error: null, editingText: true });
+const emptySide = (): SideState => ({
+  text: "",
+  data: null,
+  error: null,
+  editingText: true,
+  format: "json",
+  layout: defaultFlatLayout(),
+});
+
+/** Field names per flat-file section, from the data. */
+function sectionFields(data: Json | null): Record<SectionName, string[]> {
+  const out = { header: [], body: [], footer: [] } as Record<SectionName, string[]>;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return out;
+  for (const name of SECTIONS) {
+    const v = (data as Record<string, Json>)[name];
+    const first = Array.isArray(v) ? v[0] : v;
+    if (typeof first === "object" && first !== null && !Array.isArray(first)) out[name] = Object.keys(first);
+  }
+  return out;
+}
 const other = (side: Side): Side => (side === "left" ? "right" : "left");
 const newId = () => Math.random().toString(36).slice(2, 10);
 
@@ -78,6 +94,8 @@ export default function ObjectMapper() {
     right: emptySide(),
   });
   const [primary, setPrimary] = useState<Side>("left");
+  // Off: the primary's structure is locked (its values can still be edited). On: both sides fully editable.
+  const [bothEditable, setBothEditable] = useState(false);
   const [mappings, setMappings] = useState<Mapping[]>([]);
   const [selected, setSelected] = useState<Selection | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -103,6 +121,7 @@ export default function ObjectMapper() {
         });
         setPrimary(saved.primary ?? "left");
         setMappings(saved.mappings ?? []);
+        setBothEditable(saved.bothEditable === true);
       }
     } catch {
       // ignore unreadable saved state
@@ -113,11 +132,11 @@ export default function ObjectMapper() {
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ sides, primary, mappings }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ sides, primary, mappings, bothEditable }));
     } catch {
       // storage unavailable; the app still works without it
     }
-  }, [sides, primary, mappings, loaded]);
+  }, [sides, primary, mappings, bothEditable, loaded]);
 
   // ---------- derived trees ----------
   const trees = useMemo(
@@ -159,11 +178,14 @@ export default function ObjectMapper() {
   // ---------- data edits ----------
   /** Replace a side's data and drop mappings that point at fields that no longer exist. */
   const commitData = useCallback(
-    (side: Side, data: Json | null, rewrite?: (m: Mapping) => Mapping) => {
-      setSides((s) => ({
-        ...s,
-        [side]: { ...s[side], data, text: data === null ? s[side].text : JSON.stringify(data, null, 2) },
-      }));
+    (side: Side, data: Json | null, rewrite?: (m: Mapping) => Mapping, keepText = false) => {
+      setSides((s) => {
+        const cur = s[side];
+        if (data === null) return { ...s, [side]: { ...cur, data } };
+        const layout = cur.format === "flat" ? syncLayoutFields(cur.layout, data) : cur.layout;
+        const text = keepText ? cur.text : writeFormat(cur.format, data, layout);
+        return { ...s, [side]: { ...cur, data, layout, text } };
+      });
       const valid = data === null ? new Set<string>() : allPaths(buildTree(data));
       setMappings((ms) =>
         ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => valid.has(pathId(m[side]))),
@@ -173,34 +195,85 @@ export default function ObjectMapper() {
     [],
   );
 
-  const loadText = (side: Side) => {
-    const text = sides[side].text.trim();
+  /** Read a side's text with its format (and flat layout). */
+  const readSide = (side: Side, layout: FlatLayout) => {
+    const st = sides[side];
+    const text = st.text.trim();
     if (!text) {
-      setSides((s) => ({ ...s, [side]: { ...s[side], error: "Paste some JSON first." } }));
+      setSides((s) => ({ ...s, [side]: { ...s[side], error: `Paste some ${formatInfo(st.format).label} first.` } }));
       return;
     }
     try {
-      const data = JSON.parse(text) as Json;
-      if (typeof data !== "object" || data === null) throw new Error("Top level must be an object or array.");
-      setSides((s) => ({ ...s, [side]: { ...s[side], error: null, editingText: false } }));
-      commitData(side, data);
+      const { data, warnings } = readFormat(st.format, text, layout);
+      setSides((s) => ({ ...s, [side]: { ...s[side], layout, error: null, editingText: false } }));
+      // Keep the pasted text as-is rather than re-printing it.
+      commitData(side, data, undefined, true);
+      if (warnings.length) {
+        setNotice({ kind: "ok", text: `Read the ${side} file, but some lines were skipped.`, details: warnings });
+      }
     } catch (e) {
       setSides((s) => ({ ...s, [side]: { ...s[side], error: (e as Error).message } }));
     }
   };
 
-  const loadExample = () => {
-    setSides({
-      left: { text: JSON.stringify(EXAMPLE.left, null, 2), data: EXAMPLE.left, error: null, editingText: false },
-      right: { text: JSON.stringify(EXAMPLE.right, null, 2), data: EXAMPLE.right, error: null, editingText: false },
+  const loadText = (side: Side) => {
+    const st = sides[side];
+    let layout = st.layout;
+    // First read of a flat file: guess how its fields are separated.
+    if (st.format === "flat" && SECTIONS.every((n) => layout[n].fields.length === 0)) {
+      layout = { ...layout, delimiter: guessDelimiter(st.text.trim()) };
+    }
+    readSide(side, layout);
+  };
+
+  /** Switch a side's format. Loaded data is kept and shown in the new format. */
+  const changeFormat = (side: Side, format: Format) =>
+    setSides((s) => {
+      const cur = s[side];
+      const text = cur.data === null ? cur.text : writeFormat(format, cur.data, cur.layout);
+      return { ...s, [side]: { ...cur, format, text, error: null } };
     });
+
+  /** New flat layout: the source file is re-read with it; the target file is re-written with it. */
+  const applyLayout = (side: Side, layout: FlatLayout) => {
+    const st = sides[side];
+    if (side === primary && st.text.trim()) {
+      readSide(side, layout);
+      return;
+    }
+    setSides((s) => {
+      const cur = s[side];
+      const text = cur.data === null ? cur.text : writeFormat(cur.format, cur.data, layout);
+      return { ...s, [side]: { ...cur, layout, text } };
+    });
+  };
+
+  /** Give a target object the header / body / footer fields a flat file is written from. */
+  const addFlatSections = (side: Side) => {
+    const data = sides[side].data;
+    const base = typeof data === "object" && data !== null && !Array.isArray(data) ? data : {};
+    commitData(side, { header: {}, body: [{}], footer: {}, ...base });
+  };
+
+  /** Load an order (source, left) and an empty invoice (target, right) in the chosen formats. */
+  const loadExample = (sourceFormat: Format, targetFormat: Format) => {
+    const example = (role: "source" | "target", format: Format): SideState => {
+      const { text, layout } = EXAMPLES[role][format];
+      return { ...emptySide(), format, layout, text, data: readFormat(format, text, layout).data, editingText: false };
+    };
+    setSides({ left: example("source", sourceFormat), right: example("target", targetFormat) });
     setPrimary("left");
     setMappings([]);
     setSelected(null);
+    setNotice(null);
   };
 
   const resetAll = () => {
-    setSides({ left: emptySide(), right: emptySide() });
+    // Keep each side's chosen format and layout.
+    setSides((s) => ({
+      left: { ...emptySide(), format: s.left.format, layout: s.left.layout },
+      right: { ...emptySide(), format: s.right.format, layout: s.right.layout },
+    }));
     setMappings([]);
     setSelected(null);
   };
@@ -391,6 +464,23 @@ export default function ObjectMapper() {
     );
   }, [sides, primary, secondary, mappings]);
 
+  const resultText = useMemo(() => {
+    if (result === null) return null;
+    const target = sides[secondary];
+    return writeFormat(target.format, result, target.layout);
+  }, [result, sides, secondary]);
+
+  const downloadResult = () => {
+    if (resultText === null) return;
+    const info = formatInfo(sides[secondary].format);
+    const url = URL.createObjectURL(new Blob([resultText], { type: info.mime }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `mapped-result.${info.extension}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const exportExcel = () =>
     downloadXlsx(
       "object-mapping.xlsx",
@@ -399,6 +489,10 @@ export default function ObjectMapper() {
         data: { left: sides.left.data, right: sides.right.data },
         mappings,
         result,
+        formats: {
+          left: { format: sides.left.format, layout: sides.left.layout },
+          right: { format: sides.right.format, layout: sides.right.layout },
+        },
       }),
     );
 
@@ -412,13 +506,12 @@ export default function ObjectMapper() {
       const imported = parseWorkbook(await readXlsx(await file.arrayBuffer()));
       const hasWork = sides.left.data !== null || sides.right.data !== null || mappings.length > 0;
       if (hasWork && !window.confirm(`Replace the current objects and mappings with "${file.name}"?`)) return;
-      const sideFrom = (data: Json): SideState => ({
-        text: JSON.stringify(data, null, 2),
-        data,
-        error: null,
-        editingText: false,
-      });
-      setSides({ left: sideFrom(imported.data.left), right: sideFrom(imported.data.right) });
+      const sideFrom = (side: Side): SideState => {
+        const { format, layout } = imported.formats[side];
+        const data = imported.data[side];
+        return { ...emptySide(), format, layout, data, text: writeFormat(format, data, layout), editingText: false };
+      };
+      setSides({ left: sideFrom("left"), right: sideFrom("right") });
       setPrimary(imported.primary);
       setMappings(imported.mappings.map((m) => ({ ...m, id: newId() })));
       setSelected(null);
@@ -527,20 +620,43 @@ export default function ObjectMapper() {
     const tree = trees[side];
     const isPrimary = side === primary;
     const showTree = tree && !state.editingText;
+    const label = formatInfo(state.format).label;
 
     return (
       <section className="flex min-w-0 flex-col rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         <header className="flex flex-wrap items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
           <h2 className="text-sm font-semibold capitalize">{side} object</h2>
           {isPrimary ? (
-            <span className="rounded-full bg-blue-600 px-2 py-0.5 text-xs font-medium text-white">
-              🔒 Primary · source
+            <span
+              className="rounded-full bg-blue-600 px-2 py-0.5 text-xs font-medium text-white"
+              title={
+                bothEditable
+                  ? "Values flow from this side. Its fields can be edited."
+                  : "Values flow from this side. Its fields are locked, but you can click a value to change it."
+              }
+            >
+              {bothEditable ? "✎ Primary · source" : "🔒 Primary · source"}
             </span>
           ) : (
             <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
               ✎ Editable · target
             </span>
           )}
+          <label className="flex items-center gap-1.5 text-xs text-zinc-500">
+            Format
+            <select
+              value={state.format}
+              onChange={(e) => changeFormat(side, e.target.value as Format)}
+              aria-label={`${side} file format`}
+              className="rounded-md border border-zinc-300 bg-white py-0.5 pl-1.5 pr-1 text-xs font-medium text-zinc-800 outline-none hover:border-zinc-400 focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+            >
+              {FORMATS.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="ml-auto flex gap-1">
             {!isPrimary && (
               <HeaderButton onClick={() => setPrimary(side)}>Make primary</HeaderButton>
@@ -549,11 +665,23 @@ export default function ObjectMapper() {
               <HeaderButton
                 onClick={() => setSides((s) => ({ ...s, [side]: { ...s[side], editingText: true } }))}
               >
-                {isPrimary ? "Replace JSON" : "Edit JSON"}
+                {isPrimary ? `Replace ${label}` : `Edit ${label}`}
               </HeaderButton>
             )}
           </div>
         </header>
+
+        {state.format === "flat" && (
+          <FlatLayoutEditor
+            key={JSON.stringify(state.layout)}
+            layout={state.layout}
+            role={isPrimary ? "source" : "target"}
+            currentFields={sectionFields(state.data)}
+            hasSections={SECTIONS.some((n) => sectionFields(state.data)[n].length > 0)}
+            onApply={(layout) => applyLayout(side, layout)}
+            onAddSections={() => addFlatSections(side)}
+          />
+        )}
 
         {showTree ? (
           <div ref={panelRefs[side]} data-drag-scroll className="max-h-[65vh] min-h-64 overflow-auto p-2">
@@ -561,7 +689,7 @@ export default function ObjectMapper() {
               <FieldTree
                 root={tree as FieldNode}
                 side={side}
-                editable={!isPrimary}
+                editable={!isPrimary || bothEditable}
                 selectedId={selected?.side === side ? pathId(selected.path) : null}
                 mappedColors={mappedColors[side]}
                 suggestion={isPrimary ? null : suggestion}
@@ -581,7 +709,7 @@ export default function ObjectMapper() {
               onChange={(e) =>
                 setSides((s) => ({ ...s, [side]: { ...s[side], text: e.target.value, error: null } }))
               }
-              placeholder={`Paste the ${isPrimary ? "primary (source)" : "target"} JSON object here…`}
+              placeholder={`Paste the ${isPrimary ? "primary (source)" : "target"} ${label} here, e.g.\n\n${PLACEHOLDERS[state.format]}`}
               spellCheck={false}
               className="min-h-64 flex-1 resize-y rounded-md border border-zinc-300 bg-zinc-50 p-2 font-mono text-xs outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-950"
             />
@@ -624,15 +752,17 @@ export default function ObjectMapper() {
             Values flow from the 🔒 primary object into the editable one.
           </p>
         </div>
-        <div className="ml-auto flex gap-2">
-          <HeaderButton onClick={() => setPrimary(secondary)}>⇄ Swap primary</HeaderButton>
-          <HeaderButton
-            onClick={exportExcel}
-            disabled={sides.left.data === null && sides.right.data === null}
-          >
-            ⬇ Export to Excel
-          </HeaderButton>
-          <HeaderButton onClick={() => fileInputRef.current?.click()}>⬆ Import Excel</HeaderButton>
+        <div className="ml-auto">
+          <AppMenu
+            bothEditable={bothEditable}
+            onBothEditable={setBothEditable}
+            onSwap={() => setPrimary(secondary)}
+            onExport={exportExcel}
+            exportDisabled={sides.left.data === null && sides.right.data === null}
+            onImport={() => fileInputRef.current?.click()}
+            onLoadExample={loadExample}
+            onClear={resetAll}
+          />
           <input
             ref={fileInputRef}
             type="file"
@@ -644,8 +774,6 @@ export default function ObjectMapper() {
               if (file) importExcel(file);
             }}
           />
-          <HeaderButton onClick={loadExample}>Load example</HeaderButton>
-          <HeaderButton onClick={resetAll}>Clear</HeaderButton>
         </div>
       </div>
 
@@ -760,6 +888,9 @@ export default function ObjectMapper() {
         secondaryTree={secondaryTree}
         mappingSpec={mappingSpec}
         result={result}
+        resultText={resultText}
+        resultFormat={sides[secondary].format}
+        onDownload={downloadResult}
         hoveredIds={hoveredIds}
         onHover={(id) => setHover(id ? { ids: [id], via: "list" } : null)}
         onRemove={(id) => removeMappings([id])}
@@ -850,6 +981,9 @@ function OutputPanel({
   secondaryTree,
   mappingSpec,
   result,
+  resultText,
+  resultFormat,
+  onDownload,
   hoveredIds,
   onHover,
   onRemove,
@@ -862,6 +996,10 @@ function OutputPanel({
   secondaryTree: FieldNode | null;
   mappingSpec: { from: string; to: string }[];
   result: Json | null;
+  /** The mapped result written in the target's file format. */
+  resultText: string | null;
+  resultFormat: Format;
+  onDownload: () => void;
   hoveredIds: string[] | null;
   onHover: (id: string | null) => void;
   onRemove: (id: string) => void;
@@ -873,7 +1011,7 @@ function OutputPanel({
   const secondary = other(primary);
 
   const texts: Record<Exclude<Tab, "mappings">, string | null> = {
-    result: result === null ? null : JSON.stringify(result, null, 2),
+    result: resultText,
     flat: result === null ? null : JSON.stringify(flatten(result), null, 2),
     spec: JSON.stringify(mappingSpec, null, 2),
   };
@@ -892,7 +1030,7 @@ function OutputPanel({
 
   const tabs: [Tab, string][] = [
     ["mappings", `Mappings (${mappings.length})`],
-    ["result", "Mapped result"],
+    ["result", resultFormat === "json" ? "Mapped result" : `Mapped result (${formatInfo(resultFormat).label})`],
     ["flat", "Flattened JSON"],
     ["spec", "Mapping JSON"],
   ];
@@ -933,6 +1071,9 @@ function OutputPanel({
         ))}
         {!collapsed && (
           <div className="ml-auto pb-1">
+            {tab === "result" && resultText !== null && (
+              <HeaderButton onClick={onDownload}>⬇ Download .{formatInfo(resultFormat).extension}</HeaderButton>
+            )}{" "}
             {copyText && <HeaderButton onClick={copy}>{copied ? "Copied!" : "Copy"}</HeaderButton>}
             {tab === "mappings" && mappings.length > 0 && <HeaderButton onClick={onClear}>Remove all</HeaderButton>}
           </div>

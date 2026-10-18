@@ -310,7 +310,8 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
         {node.type === "array" && <ArrayOf {...props} node={node} />}
 
         {node.sample !== undefined &&
-          (editable && node.type !== "null" && !isItem ? (
+          // Values can be edited on both sides; the locked primary only blocks structural changes.
+          (node.type !== "null" && !isItem ? (
             <ValueEditor
               value={node.sample}
               type={node.type}

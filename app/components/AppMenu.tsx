@@ -1,0 +1,209 @@
+"use client";
+
+// The top-right "☰ Menu": every page-level action grouped in one dropdown.
+// It opens on hover (and on click / keyboard). Once you interact with
+// something inside it, it stays open until you click outside or press Esc,
+// so native dropdowns inside it don't close it.
+
+import { useEffect, useRef, useState } from "react";
+import { FORMATS, type Format } from "@/lib/formats";
+import { ThemeSwitch } from "./ThemeSwitch";
+
+interface Props {
+  bothEditable: boolean;
+  onBothEditable: (on: boolean) => void;
+  onSwap: () => void;
+  onExport: () => void;
+  exportDisabled: boolean;
+  onImport: () => void;
+  onLoadExample: (source: Format, target: Format) => void;
+  onClear: () => void;
+}
+
+const CLOSE_DELAY = 250; // ms; lets the pointer cross the gap between button and panel
+
+export function AppMenu(props: Props) {
+  const [open, setOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [source, setSource] = useState<Format>("json");
+  const [target, setTarget] = useState<Format>("json");
+  const ref = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<number | undefined>(undefined);
+
+  const close = () => {
+    setOpen(false);
+    setPinned(false);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  /** Run a menu action, then close the menu. */
+  const act = (fn: () => void) => () => {
+    fn();
+    close();
+  };
+
+  const formatSelect = (label: string, value: Format, set: (f: Format) => void) => (
+    <label className="flex items-center justify-between gap-2">
+      <span className="text-zinc-600 dark:text-zinc-400">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => set(e.target.value as Format)}
+        aria-label={`Example ${label.toLowerCase()} format`}
+        className="w-28 rounded-md border border-zinc-300 bg-white px-1.5 py-0.5 dark:border-zinc-700 dark:bg-zinc-900"
+      >
+        {FORMATS.map((f) => (
+          <option key={f.id} value={f.id}>
+            {f.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+
+  return (
+    <div
+      ref={ref}
+      className="relative"
+      onMouseEnter={() => {
+        window.clearTimeout(closeTimer.current);
+        setOpen(true);
+      }}
+      onMouseLeave={() => {
+        if (pinned) return;
+        closeTimer.current = window.setTimeout(() => setOpen(false), CLOSE_DELAY);
+      }}
+      onPointerDown={() => setPinned(true)}
+    >
+      <button
+        // The button handles its own clicks: hovering opens, a click pins open, a second click closes.
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={() => {
+          if (open && pinned) close();
+          else {
+            setOpen(true);
+            setPinned(true);
+          }
+        }}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="flex items-center gap-2 rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+      >
+        <span aria-hidden className="text-base leading-none">
+          ☰
+        </span>
+        Menu
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Menu"
+          className="absolute right-0 top-full z-40 mt-1 w-72 overflow-hidden rounded-lg border border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        >
+          <Group title="Workspace">
+            <Item onClick={act(props.onSwap)}>⇄ Swap primary side</Item>
+            <label className="flex cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+              <span>✎ Both sides editable</span>
+              <span className="relative inline-flex h-4 w-7 items-center">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={props.bothEditable}
+                  onChange={(e) => props.onBothEditable(e.target.checked)}
+                  className="peer sr-only"
+                />
+                <span className="absolute inset-0 rounded-full bg-zinc-300 transition-colors peer-checked:bg-blue-600 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-400 dark:bg-zinc-600" />
+                <span className="absolute left-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform peer-checked:translate-x-3" />
+              </span>
+            </label>
+          </Group>
+
+          <Group title="Excel">
+            <Item onClick={act(props.onExport)} disabled={props.exportDisabled}>
+              ⬇ Export to Excel
+            </Item>
+            <Item onClick={act(props.onImport)}>⬆ Import from Excel…</Item>
+          </Group>
+
+          <Group title="Load example">
+            <div className="flex flex-col gap-1.5 px-2 py-1 text-xs">
+              <p className="text-zinc-500">An order (source) and an empty invoice (target).</p>
+              {formatSelect("Source", source, setSource)}
+              {formatSelect("Target", target, setTarget)}
+              <button
+                onClick={act(() => props.onLoadExample(source, target))}
+                className="mt-0.5 rounded-md bg-zinc-900 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                Load example
+              </button>
+            </div>
+          </Group>
+
+          <Group title="Appearance">
+            <div className="flex items-center justify-between px-2 py-1">
+              <span className="text-zinc-600 dark:text-zinc-400">Theme</span>
+              <ThemeSwitch />
+            </div>
+          </Group>
+
+          <div className="border-t border-zinc-200 p-1 dark:border-zinc-800">
+            <Item onClick={act(props.onClear)} danger>
+              Clear everything
+            </Item>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Group({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="border-b border-zinc-200 p-1 last:border-b-0 dark:border-zinc-800">
+      <div className="px-2 pb-0.5 pt-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-400">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Item({
+  children,
+  onClick,
+  disabled,
+  danger,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex w-full items-center rounded-md px-2 py-1.5 text-left disabled:opacity-40 ${
+        danger
+          ? "text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950"
+          : "text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}

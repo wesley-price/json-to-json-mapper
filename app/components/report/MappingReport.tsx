@@ -363,6 +363,15 @@ export function MappingReport() {
           <p className="text-xs text-zinc-500">Every target field is mapped.</p>
         )}
 
+        {report.resultHeadersText && (
+          <>
+            <h3 className="mt-5 mb-1 text-sm font-semibold">Mapped headers</h3>
+            <pre className="whitespace-pre-wrap break-all rounded-md border border-zinc-200 bg-zinc-50 p-3 font-mono text-[10px] leading-snug">
+              {report.resultHeadersText}
+            </pre>
+          </>
+        )}
+
         <h3 className="mt-5 mb-1 text-sm font-semibold">Mapped result ({formatInfo(dst.format).label})</h3>
         <pre className="whitespace-pre-wrap break-all rounded-md border border-zinc-200 bg-zinc-50 p-3 font-mono text-[10px] leading-snug">
           {report.resultText}

@@ -3,12 +3,18 @@
 // be mapped onto any target format.
 
 import { type FlatLayout, type Format, defaultFlatLayout } from "./formats";
+import type { Headers } from "./headers";
 
 export interface ExampleFile {
   text: string;
   /** Layout for flat files (record codes and field names). */
   layout: FlatLayout;
+  /** Headers that travel with the document (JSON and XML only). */
+  headers?: Headers;
 }
+
+// Message headers on the order documents, e.g. which store sent it.
+const SOURCE_HEADERS: Headers = { "store-loc": "STORE-042", "message-id": "MSG-7781" };
 
 function flatLayout(fields: { header: string[]; body: string[]; footer: string[] }, codes: [string, string, string]) {
   const layout = defaultFlatLayout();
@@ -104,8 +110,8 @@ TRL|0|0
 
 export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> = {
   source: {
-    json: { text: JSON.stringify(SOURCE_JSON, null, 2), layout: defaultFlatLayout() },
-    xml: { text: SOURCE_XML, layout: defaultFlatLayout() },
+    json: { text: JSON.stringify(SOURCE_JSON, null, 2), layout: defaultFlatLayout(), headers: SOURCE_HEADERS },
+    xml: { text: SOURCE_XML, layout: defaultFlatLayout(), headers: SOURCE_HEADERS },
     csv: { text: SOURCE_CSV, layout: defaultFlatLayout() },
     flat: {
       text: SOURCE_FLAT,

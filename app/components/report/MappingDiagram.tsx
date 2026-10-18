@@ -3,6 +3,7 @@
 // for each mapping's close-up. Drawn from the data (not screenshotted), so it
 // prints crisply and always fits.
 
+import { HEADERS } from "@/lib/headers";
 import { ARRAY_ITEM, type FieldNode, type FieldType, type Path, findNode, pathId } from "@/lib/json-tree";
 
 export interface DiagramRow {
@@ -44,7 +45,7 @@ function rowFor(node: FieldNode, depth: number): DiagramRow {
   const childCount = node.type === "object" ? node.children.length : 0;
   return {
     id: pathId(node.path),
-    label: node.key === ARRAY_ITEM ? "each item" : node.key,
+    label: node.key === ARRAY_ITEM ? "each item" : node.key === HEADERS ? "Headers" : node.key,
     type: node.type,
     sample:
       node.sample !== undefined

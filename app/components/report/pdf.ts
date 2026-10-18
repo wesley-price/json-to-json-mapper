@@ -344,6 +344,22 @@ export async function downloadReportPdf(
 
     y += 6;
     ensure(12);
+    if (model.resultHeadersText) {
+      font("helvetica", "bold", 10);
+      doc.text("Mapped headers", MARGIN, y);
+      y += 5;
+      font("courier", "normal", 7);
+      doc.setTextColor("#27272a");
+      for (const raw of model.resultHeadersText.split("\n")) {
+        for (const line of doc.splitTextToSize(pdfText(raw) || " ", CONTENT_W) as string[]) {
+          ensure(3.2);
+          doc.text(line, MARGIN, y);
+          y += 3.1;
+        }
+      }
+      y += 6;
+      ensure(12);
+    }
     font("helvetica", "bold", 10);
     doc.text(`Mapped result (${formatInfo(model.dst.format).label})`, MARGIN, y);
     y += 5;

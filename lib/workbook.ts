@@ -8,6 +8,7 @@
 //   3. "Primary (<side>)" Field | Value | Type  (flattened primary object)
 //   4. "Target (<side>)"  Field | Value | Type  (flattened editable object)
 //   5. "Formats"         Side | Format | Flat layout (JSON)   (optional; older workbooks are JSON)
+//   6. "Headers"         Side | Header | Value | Type         (optional; JSON/XML header pairs)
 
 import {
   type Json,
@@ -24,6 +25,7 @@ import {
   unflatten,
 } from "./json-tree";
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
+import { type Headers, lookupTree, supportsHeaders } from "./headers";
 import type { Cell, Sheet } from "./xlsx";
 
 export type SideFormats = Record<Side, { format: Format; layout: FlatLayout }>;
@@ -53,8 +55,10 @@ export function buildWorkbook(opts: {
   mappings: Mapping[];
   result: Json | null;
   formats: SideFormats;
+  headers?: Record<Side, Headers>;
 }): Sheet[] {
   const { primary, data, mappings, result, formats } = opts;
+  const headers = opts.headers ?? { left: {}, right: {} };
   const secondary = other(primary);
   const trees = {
     left: data.left === null ? null : buildTree(data.left),
@@ -84,6 +88,18 @@ export function buildWorkbook(opts: {
     flatSheet(`Primary (${primary})`, data[primary]),
     flatSheet(`Target (${secondary})`, data[secondary]),
     {
+      name: "Headers",
+      rows: [
+        ["Side", "Header", "Value", "Type"],
+        ...(["left", "right"] as const).flatMap((side) =>
+          Object.entries(headers[side] ?? {}).map(([name, value]): Cell[] => {
+            const [, cell, type] = flatRow(name, value);
+            return [side, name, cell, type];
+          }),
+        ),
+      ],
+    },
+    {
       name: "Formats",
       rows: [
         ["Side", "Format", "Flat layout (JSON)"],
@@ -104,6 +120,7 @@ export interface ImportedWorkbook {
   data: Record<Side, Json>;
   mappings: Omit<Mapping, "id">[];
   formats: SideFormats;
+  headers: Record<Side, Headers>;
   /** Human-readable notes about anything that was skipped. */
   warnings: string[];
 }
@@ -179,7 +196,12 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
     [secondary]: readFlatSheet(targetSheet, targetSheet.name, warnings),
   } as Record<Side, Json>;
 
-  const valid = { left: allPaths(buildTree(data.left)), right: allPaths(buildTree(data.right)) };
+  // Header fields are valid mapping ends too (on sides whose format has headers).
+  const formats = readFormats(sheets, warnings);
+  const headers = readHeaders(sheets, warnings);
+  const fieldsOf = (side: Side) =>
+    allPaths(lookupTree(data[side], supportsHeaders(formats[side].format) ? headers[side] : undefined) ?? buildTree(data[side]));
+  const valid = { left: fieldsOf("left"), right: fieldsOf("right") };
   const mappings: Omit<Mapping, "id">[] = [];
   const seenPairs = new Set<string>();
 
@@ -216,7 +238,25 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
     if (group.length > 1 && join !== undefined) group.forEach((o) => (o.join = join));
     else if (group.length === 1) delete m.join;
   }
-  return { primary, data, mappings, formats: readFormats(sheets, warnings), warnings };
+  return { primary, data, mappings, formats, headers, warnings };
+}
+
+/** Header name/value pairs per side; a workbook without a Headers sheet has none. */
+function readHeaders(sheets: Sheet[], warnings: string[]): Record<Side, Headers> {
+  const headers: Record<Side, Headers> = { left: {}, right: {} };
+  const sheet = sheets.find((s) => s.name.toLowerCase().startsWith("headers"));
+  if (!sheet) return headers;
+  sheet.rows.slice(1).forEach((row, i) => {
+    const side = String(row[0] ?? "").trim().toLowerCase();
+    const name = String(row[1] ?? "").trim();
+    if (!name) return;
+    if (side !== "left" && side !== "right") {
+      warnings.push(`Headers row ${i + 2}: "${row[0]}" isn't left or right.`);
+      return;
+    }
+    headers[side][name] = toJson(row[2] ?? null, row[3] ?? null);
+  });
+  return headers;
 }
 
 /** Each side's file format; a workbook without a Formats sheet is all JSON. */

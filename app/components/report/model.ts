@@ -11,7 +11,6 @@ import {
   type Mapping,
   type Path,
   type Side,
-  applyMappings,
   buildTree,
   findNode,
   isPrefix,
@@ -19,9 +18,9 @@ import {
   joinsFor,
   pathId,
   pathLabel,
-  valuesAt,
 } from "@/lib/json-tree";
 import type { DiagramLink } from "./MappingDiagram";
+import { type Headers, applyWithHeaders, headersText, lookupTree, supportsHeaders, valuesAtPath } from "@/lib/headers";
 
 export const STORAGE_KEY = "object-mapper:v1";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
@@ -30,6 +29,7 @@ interface SavedSide {
   data: Json | null;
   format?: Format;
   layout?: FlatLayout;
+  headers?: Headers;
 }
 export interface Saved {
   sides: Record<Side, SavedSide>;
@@ -135,8 +135,11 @@ export function buildReport(saved: Saved | null) {
   const srcFormat = src.format ?? "json";
   const dstFormat = dst.format ?? "json";
   const dstLayout = dst.layout ?? defaultFlatLayout();
-  const srcTree = buildTree(src.data);
-  const dstTree = buildTree(dst.data);
+  // Header fields (JSON/XML) are part of each side's tree, ahead of the body.
+  const srcHeaders = supportsHeaders(srcFormat) ? src.headers : undefined;
+  const dstHeaders = supportsHeaders(dstFormat) ? dst.headers : undefined;
+  const srcTree = lookupTree(src.data, srcHeaders) ?? buildTree(src.data);
+  const dstTree = lookupTree(dst.data, dstHeaders) ?? buildTree(dst.data);
   const joins = joinsFor(saved.mappings ?? [], secondary);
 
   const pairs = (saved.mappings ?? []).map((m, i) => ({
@@ -145,12 +148,14 @@ export function buildReport(saved: Saved | null) {
     to: m[secondary],
     color: COLORS[i % COLORS.length],
   }));
-  const result = applyMappings(
-    src.data,
-    dst.data,
+  const mapped = applyWithHeaders(
+    { body: src.data, headers: srcHeaders },
+    { body: dst.data, headers: dstHeaders },
     pairs.map((m) => ({ from: m.from, to: m.to })),
     joins,
   );
+  const result = mapped.body;
+  const resultHeaders = dstHeaders ? mapped.headers : undefined;
 
   // Group by target, in order of first appearance; each group is one numbered entry.
   const groups = new Map<string, typeof pairs>();
@@ -165,11 +170,11 @@ export function buildReport(saved: Saved | null) {
     n++;
     const to = group[0].to;
     const toType = findNode(dstTree, to)?.type;
-    const written = valuesAt(result, to);
+    const written = valuesAtPath(result, resultHeaders, to);
     const combined = group.length > 1;
     const parts: ReportMapping[] = group.map((p) => {
       const fromType = findNode(srcTree, p.from)?.type;
-      const sourceValues = valuesAt(src.data!, p.from);
+      const sourceValues = valuesAtPath(src.data!, srcHeaders, p.from);
       return {
         ...p,
         n,
@@ -227,6 +232,8 @@ export function buildReport(saved: Saved | null) {
     combined: combinedFields,
     result,
     resultText: writeFormat(dstFormat, result, dstLayout),
+    /** The target's headers after mapping as "name: value" lines (empty when none). */
+    resultHeadersText: resultHeaders && Object.keys(resultHeaders).length ? headersText(resultHeaders) : "",
     unmapped: targetLeaves.filter((p) => !covered(p)).map(pathLabel),
     targetLeafCount: targetLeaves.length,
     mappedLeafCount: targetLeaves.filter(covered).length,

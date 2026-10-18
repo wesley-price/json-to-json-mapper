@@ -65,6 +65,10 @@ export interface FieldTreeProps {
   onSetArrayItems: (arrayPath: Path, items: Json[]) => void;
   /** Change a field's example value. */
   onSetValue: (path: Path, value: Json) => void;
+  /** Title for the root row instead of "{ root }" (e.g. "Headers"). */
+  rootLabel?: React.ReactNode;
+  /** Wording for the add row at the top level (e.g. "Add header"). */
+  addLabel?: string;
 }
 
 const TYPE_STYLES: Record<FieldType, string> = {
@@ -159,7 +163,7 @@ export function FieldTree(props: FieldTreeProps) {
             <ArrayOf {...props} node={root} />
           </>
         ) : (
-          <span>{"{ root }"}</span>
+          <span>{props.rootLabel ?? "{ root }"}</span>
         )}
       </div>
       <Children {...props} node={root} depth={0} />
@@ -186,6 +190,7 @@ function Children(props: FieldTreeProps & { node: FieldNode; depth: number }) {
             siblings={siblings}
             suggestion={props.suggestion}
             inList={node.key === ARRAY_ITEM}
+            label={node.path.length <= 1 && props.addLabel ? props.addLabel : undefined}
             onAdd={(key, type, itemType, map) => props.onAdd(node.path, key, type, itemType, map)}
           />
         </AddFieldDropZone>
@@ -495,12 +500,15 @@ function AddFieldRow({
   siblings,
   suggestion,
   inList,
+  label,
   onAdd,
 }: {
   depth: number;
   siblings: string[];
   suggestion: FieldSuggestion | null;
   inList: boolean;
+  /** Replaces "Add field" (e.g. "Add header"). */
+  label?: string;
   onAdd: (key: string, type: FieldType, itemType: FieldType | undefined, mapSelected: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -518,7 +526,7 @@ function AddFieldRow({
             + Add “{suggestion.key}” here, mapped from {suggestion.label}
           </span>
         ) : (
-          `+ Add field${inList ? " to each item" : ""}`
+          `+ ${label ?? "Add field"}${inList ? " to each item" : ""}`
         )}
       </button>
     );

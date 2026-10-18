@@ -14,7 +14,6 @@ import {
   type Side,
   addField,
   allPaths,
-  applyMappings,
   buildTree,
   findNode,
   flatten,
@@ -29,7 +28,6 @@ import {
   setArrayItems,
   setFieldType,
   setValueAt,
-  valuesAt,
 } from "@/lib/json-tree";
 import {
   type FlatLayout,
@@ -43,6 +41,16 @@ import {
 } from "@/lib/formats";
 import { SECTIONS, type SectionName, guessDelimiter, syncLayoutFields } from "@/lib/formats/flat";
 import { EXAMPLES } from "@/lib/examples";
+import {
+  HEADERS,
+  type Headers,
+  applyWithHeaders,
+  headersTree,
+  isHeaderPath,
+  lookupTree,
+  supportsHeaders,
+  valuesAtPath,
+} from "@/lib/headers";
 import { buildWorkbook, parseWorkbook } from "@/lib/workbook";
 import { downloadXlsx, readXlsx } from "@/lib/xlsx";
 
@@ -60,6 +68,8 @@ interface SideState {
   format: Format;
   /** How a flat file is laid out (only used when format is "flat"). */
   layout: FlatLayout;
+  /** Header name/value pairs (shown for JSON and XML). */
+  headers: Headers;
 }
 
 interface Selection {
@@ -74,7 +84,12 @@ const emptySide = (): SideState => ({
   editingText: true,
   format: "json",
   layout: defaultFlatLayout(),
+  headers: {},
 });
+
+/** A side's headers when its format has them. */
+const activeHeaders = (side: SideState): Headers | undefined =>
+  supportsHeaders(side.format) ? side.headers : undefined;
 
 /** Field names per flat-file section, from the data. */
 function sectionFields(data: Json | null): Record<SectionName, string[]> {
@@ -149,6 +164,15 @@ export default function ObjectMapper() {
     [sides.left.data, sides.right.data],
   );
 
+  // Headers and body together, for looking any mappable field up by path.
+  const lookups = useMemo(
+    () => ({
+      left: lookupTree(sides.left.data, activeHeaders(sides.left)),
+      right: lookupTree(sides.right.data, activeHeaders(sides.right)),
+    }),
+    [sides.left, sides.right],
+  );
+
   // Colors stick to a mapping, so removing one doesn't recolor the others.
   const [colorFor, setColorFor] = useState(() => new Map<string, string>());
   const missingColor = mappings.some((m) => !colorFor.has(m.id));
@@ -189,13 +213,22 @@ export default function ObjectMapper() {
         return { ...s, [side]: { ...cur, data, layout, text } };
       });
       const valid = data === null ? new Set<string>() : allPaths(buildTree(data));
-      setMappings((ms) =>
-        ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => valid.has(pathId(m[side]))),
-      );
-      setSelected((sel) => (sel && sel.side === side && !valid.has(pathId(sel.path)) ? null : sel));
+      // Body edits never touch header fields, so their mappings stay.
+      const keep = (p: Path) => isHeaderPath(p) || valid.has(pathId(p));
+      setMappings((ms) => ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => keep(m[side])));
+      setSelected((sel) => (sel && sel.side === side && !keep(sel.path) ? null : sel));
     },
     [],
   );
+
+  /** Replace a side's headers and drop mappings to header fields that no longer exist. */
+  const commitHeaders = useCallback((side: Side, headers: Headers, rewrite?: (m: Mapping) => Mapping) => {
+    setSides((s) => ({ ...s, [side]: { ...s[side], headers } }));
+    const valid = allPaths(headersTree(headers));
+    const keep = (p: Path) => !isHeaderPath(p) || valid.has(pathId(p));
+    setMappings((ms) => ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => keep(m[side])));
+    setSelected((sel) => (sel && sel.side === side && !keep(sel.path) ? null : sel));
+  }, []);
 
   /** Read a side's text with its format (and flat layout). */
   const readSide = (side: Side, layout: FlatLayout) => {
@@ -260,8 +293,16 @@ export default function ObjectMapper() {
   /** Load an order (source, left) and an empty invoice (target, right) in the chosen formats. */
   const loadExample = (sourceFormat: Format, targetFormat: Format) => {
     const example = (role: "source" | "target", format: Format): SideState => {
-      const { text, layout } = EXAMPLES[role][format];
-      return { ...emptySide(), format, layout, text, data: readFormat(format, text, layout).data, editingText: false };
+      const { text, layout, headers } = EXAMPLES[role][format];
+      return {
+        ...emptySide(),
+        format,
+        layout,
+        text,
+        headers: headers ?? {},
+        data: readFormat(format, text, layout).data,
+        editingText: false,
+      };
     };
     setSides({ left: example("source", sourceFormat), right: example("target", targetFormat) });
     setPrimary("left");
@@ -408,12 +449,12 @@ export default function ObjectMapper() {
   // Suggest key/type when adding a field on the editable side while a primary field is selected.
   const suggestion = useMemo(() => {
     if (!selected || selected.side !== primary) return null;
-    const tree = trees[primary];
+    const tree = lookups[primary];
     const node = tree && findNode(tree, selected.path);
     if (!node) return null;
     const key = [...node.path].reverse().find((s) => s !== "[]") ?? "field";
     return { key, type: node.type, itemType: node.children[0]?.type, label: pathLabel(node.path) };
-  }, [selected, primary, trees]);
+  }, [selected, primary, lookups]);
 
   const editHandlers = (side: Side) => {
     const data = sides[side].data;
@@ -452,6 +493,10 @@ export default function ObjectMapper() {
       },
       onMoveField: (from: Path, parent: Path, after?: string) => {
         if (data === null) return;
+        if (isHeaderPath(from)) {
+          setNotice({ kind: "error", text: "Headers can't be moved into the body. Add a body field instead.", details: [] });
+          return;
+        }
         const moved = moveField(data, from, parent, after);
         if ("error" in moved) {
           setNotice({ kind: "error", text: `Couldn't move that field: ${moved.error}`, details: [] });
@@ -468,20 +513,62 @@ export default function ObjectMapper() {
     };
   };
 
+  /** Edits for the Headers box. Paths start with HEADERS; the headers object is edited without it. */
+  const headerHandlers = (side: Side) => {
+    const h = sides[side].headers ?? {};
+    const rel = (p: Path) => p.slice(1);
+    const follow = (from: Path, to: Path) => (m: Mapping) =>
+      isPrefix(from, m[side]) ? { ...m, [side]: [...to, ...m[side].slice(from.length)] } : m;
+    const commit = (next: Json, rewrite?: (m: Mapping) => Mapping) => commitHeaders(side, next as Headers, rewrite);
+    return {
+      onAdd: (parent: Path, key: string, type: FieldType, itemType: FieldType | undefined, mapSelected: boolean) => {
+        commit(addField(h, rel(parent), key, type, itemType));
+        if (mapSelected && selected && selected.side !== side) {
+          createMapping(selected, { side, path: [...parent, key] });
+          setSelected(null);
+        }
+      },
+      onRemove: (path: Path) => commit(removeField(h, rel(path))),
+      onRename: (path: Path, newKey: string) =>
+        commit(renameField(h, rel(path), newKey), follow(path, [...path.slice(0, -1), newKey])),
+      onRetype: (path: Path, type: FieldType) => commit(setFieldType(h, rel(path), type)),
+      onSetValue: (path: Path, value: Json) => commit(setValueAt(h, rel(path), value)),
+      onSetArrayItems: (path: Path, items: Json[]) => commit(setArrayItems(h, rel(path), items)),
+      onSetItemType: (path: Path, itemType: FieldType) => commit(setArrayItemType(h, rel(path), itemType)),
+      onMoveField: (from: Path, parent: Path, after?: string) => {
+        if (!isHeaderPath(from)) {
+          setNotice({ kind: "error", text: "Body fields can't be moved into the headers. Add a header instead.", details: [] });
+          return;
+        }
+        const moved = moveField(h, rel(from), rel(parent), after);
+        if ("error" in moved) {
+          setNotice({ kind: "error", text: `Couldn't move that header: ${moved.error}`, details: [] });
+          return;
+        }
+        setNotice(null);
+        commit(moved.data, follow(from, [HEADERS, ...moved.path]));
+      },
+    };
+  };
+
   // ---------- output ----------
-  const primaryTree = trees[primary];
-  const secondaryTree = trees[secondary];
-  const result = useMemo(() => {
-    const src = sides[primary].data;
-    const tpl = sides[secondary].data;
-    if (src === null || tpl === null) return null;
-    return applyMappings(
-      src,
-      tpl,
+  const primaryTree = lookups[primary];
+  const secondaryTree = lookups[secondary];
+  const mapped = useMemo(() => {
+    const src = sides[primary];
+    const tpl = sides[secondary];
+    if (src.data === null || tpl.data === null) return null;
+    return applyWithHeaders(
+      { body: src.data, headers: activeHeaders(src) },
+      { body: tpl.data, headers: activeHeaders(tpl) },
       mappings.map((m) => ({ from: m[primary], to: m[secondary] })),
       joinsFor(mappings, secondary),
     );
   }, [sides, primary, secondary, mappings]);
+  const result = mapped?.body ?? null;
+  // The target's headers after mapping (when its format has headers and there are any).
+  const resultHeaders =
+    mapped && supportsHeaders(sides[secondary].format) && Object.keys(mapped.headers).length ? mapped.headers : null;
 
   /** Set the separator for every mapping into the target `targetId`. */
   const setJoin = (targetId: string, join: string) =>
@@ -530,6 +617,7 @@ export default function ObjectMapper() {
           left: { format: sides.left.format, layout: sides.left.layout },
           right: { format: sides.right.format, layout: sides.right.layout },
         },
+        headers: { left: sides.left.headers ?? {}, right: sides.right.headers ?? {} },
       }),
     );
 
@@ -546,7 +634,15 @@ export default function ObjectMapper() {
       const sideFrom = (side: Side): SideState => {
         const { format, layout } = imported.formats[side];
         const data = imported.data[side];
-        return { ...emptySide(), format, layout, data, text: writeFormat(format, data, layout), editingText: false };
+        return {
+          ...emptySide(),
+          format,
+          layout,
+          data,
+          headers: imported.headers[side],
+          text: writeFormat(format, data, layout),
+          editingText: false,
+        };
       };
       setSides({ left: sideFrom("left"), right: sideFrom("right") });
       setPrimary(imported.primary);
@@ -731,6 +827,31 @@ export default function ObjectMapper() {
         {showTree ? (
           <div ref={panelRefs[side]} data-drag-scroll className="max-h-[65vh] min-h-64 overflow-auto p-2">
             <div>
+              {supportsHeaders(state.format) && (
+                <div className="mb-2 rounded-md border border-dashed border-zinc-300 bg-zinc-50/60 pb-1 dark:border-zinc-700 dark:bg-zinc-950/30">
+                  <FieldTree
+                    root={headersTree(state.headers ?? {})}
+                    side={side}
+                    // Headers are details you define, so they can be edited even on the locked primary.
+                    editable
+                    rootLabel={
+                      <span className="font-sans text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                        Headers
+                      </span>
+                    }
+                    addLabel="Add header"
+                    selectedId={selected?.side === side ? pathId(selected.path) : null}
+                    mappedColors={mappedColors[side]}
+                    suggestion={isPrimary ? null : suggestion}
+                    onSelect={(path) => handleSelect(side, path)}
+                    onDropField={(path, from) => createMapping(from, { side, path })}
+                    onUnmap={(path) => unmapField(side, path)}
+                    highlights={highlights[side]}
+                    onHoverField={(path) => hoverField(side, path)}
+                    {...headerHandlers(side)}
+                  />
+                </div>
+              )}
               <FieldTree
                 root={tree as FieldNode}
                 side={side}
@@ -933,6 +1054,7 @@ export default function ObjectMapper() {
         secondaryTree={secondaryTree}
         mappingSpec={mappingSpec}
         result={result}
+        resultHeaders={resultHeaders}
         resultText={resultText}
         resultFormat={sides[secondary].format}
         onDownload={downloadResult}
@@ -1107,6 +1229,7 @@ function OutputPanel({
   secondaryTree,
   mappingSpec,
   result,
+  resultHeaders,
   resultText,
   resultFormat,
   onDownload,
@@ -1124,6 +1247,8 @@ function OutputPanel({
   secondaryTree: FieldNode | null;
   mappingSpec: { from: string | string[]; to: string; join?: string }[];
   result: Json | null;
+  /** The target's headers after mapping, when it has any. */
+  resultHeaders: Headers | null;
   /** The mapped result written in the target's file format. */
   resultText: string | null;
   resultFormat: Format;
@@ -1278,7 +1403,7 @@ function OutputPanel({
                 // Several sources combined into one target.
                 const targetId = pathId(to);
                 const join = group.find((m) => m.join !== undefined)?.join ?? " ";
-                const sample = result === null ? undefined : valuesAt(result, to)[0];
+                const sample = result === null ? undefined : valuesAtPath(result, resultHeaders ?? undefined, to)[0];
                 return (
                   <li key={targetId} className="rounded-lg border border-zinc-200 p-1.5 dark:border-zinc-700">
                     <div className="flex flex-wrap items-center gap-2 px-2 py-1 text-sm">
@@ -1328,6 +1453,19 @@ function OutputPanel({
             </ul>
           ))}
 
+        {tab === "result" && resultHeaders && (
+          <div className="mb-2 rounded-md border border-zinc-200 p-2 text-xs dark:border-zinc-800">
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Headers</div>
+            <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 font-mono">
+              {Object.entries(resultHeaders).map(([k, v]) => (
+                <div key={k} className="contents">
+                  <dt className="text-zinc-500">{k}</dt>
+                  <dd className="break-all">{typeof v === "string" ? v : JSON.stringify(v)}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        )}
         {tab !== "mappings" && (
           <pre className="max-h-96 overflow-auto rounded-md bg-zinc-50 p-3 font-mono text-xs dark:bg-zinc-950">
             {texts[tab] ?? "Load both objects to see the mapped result."}

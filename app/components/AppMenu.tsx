@@ -5,6 +5,7 @@
 // something inside it, it stays open until you click outside or press Esc,
 // so native dropdowns inside it don't close it.
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { FORMATS, type Format } from "@/lib/formats";
 import { ThemeSwitch } from "./ThemeSwitch";
@@ -23,6 +24,7 @@ interface Props {
 const CLOSE_DELAY = 250; // ms; lets the pointer cross the gap between button and panel
 
 export function AppMenu(props: Props) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [source, setSource] = useState<Format>("json");
@@ -50,6 +52,11 @@ export function AppMenu(props: Props) {
       window.removeEventListener("keydown", onKey);
     };
   }, [open]);
+
+  // A new tab keeps the mapper open; fall back to this tab if pop-ups are blocked.
+  const openReport = (url: string) => {
+    if (!window.open(url, "_blank")) router.push(url);
+  };
 
   /** Run a menu action, then close the menu. */
   const act = (fn: () => void) => () => {
@@ -133,7 +140,13 @@ export function AppMenu(props: Props) {
             </label>
           </Group>
 
-          <Group title="Excel">
+          <Group title="Export & import">
+            <Item onClick={act(() => openReport("/report?download"))} disabled={props.exportDisabled}>
+              ⬇ Download report (PDF)
+            </Item>
+            <Item onClick={act(() => openReport("/report"))} disabled={props.exportDisabled}>
+              📄 View report…
+            </Item>
             <Item onClick={act(props.onExport)} disabled={props.exportDisabled}>
               ⬇ Export to Excel
             </Item>

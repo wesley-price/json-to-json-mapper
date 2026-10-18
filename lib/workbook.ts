@@ -3,7 +3,8 @@
 //
 // Sheets (matched by name prefix on import, falling back to position):
 //   1. "Mapped Result"   Field | Value | Type   (export only; ignored on import)
-//   2. "Mappings"        # | Source (<side>) | Target (<side>) | Source type | Target type
+//   2. "Mappings"        # | Source (<side>) | Target (<side>) | Source type | Target type | Join with
+//                        (rows sharing a target are combined, in row order, joined with "Join with")
 //   3. "Primary (<side>)" Field | Value | Type  (flattened primary object)
 //   4. "Target (<side>)"  Field | Value | Type  (flattened editable object)
 //   5. "Formats"         Side | Format | Flat layout (JSON)   (optional; older workbooks are JSON)
@@ -68,13 +69,15 @@ export function buildWorkbook(opts: {
     {
       name: "Mappings",
       rows: [
-        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type"],
+        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with"],
         ...mappings.map((m, i): Cell[] => [
           i + 1,
           pathLabel(m[primary]),
           pathLabel(m[secondary]),
           typeAt(primary, m[primary]),
           typeAt(secondary, m[secondary]),
+          // Only meaningful when several rows share this target.
+          mappings.filter((o) => pathId(o[secondary]) === pathId(m[secondary])).length > 1 ? (m.join ?? " ") : "",
         ]),
       ],
     },
@@ -178,10 +181,10 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
 
   const valid = { left: allPaths(buildTree(data.left)), right: allPaths(buildTree(data.right)) };
   const mappings: Omit<Mapping, "id">[] = [];
-  const seenTargets = new Set<string>();
+  const seenPairs = new Set<string>();
 
   mappingSheet.rows.slice(1).forEach((row, i) => {
-    const [, from, to] = row;
+    const [, from, to, , , join] = row;
     if (from === null && to === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -195,14 +198,24 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
       if (!src.length || !dst.length) throw new Error("source and target are both required");
       if (!valid[primary].has(pathId(src))) throw new Error(`"${pathLabel(src)}" isn't a field in ${primarySheet.name}`);
       if (!valid[secondary].has(pathId(dst))) throw new Error(`"${pathLabel(dst)}" isn't a field in ${targetSheet.name}`);
-      if (seenTargets.has(pathId(dst))) throw new Error(`"${pathLabel(dst)}" is mapped more than once; kept the first`);
-      seenTargets.add(pathId(dst));
-      mappings.push(primary === "left" ? { left: src, right: dst } : { left: dst, right: src });
+      const pair = pathId(src) + pathId(dst);
+      if (seenPairs.has(pair)) throw new Error(`"${pathLabel(src)}" -> "${pathLabel(dst)}" is listed twice; kept the first`);
+      seenPairs.add(pair);
+      // Several rows with the same target are combined; "Join with" sets the separator.
+      const sep = join === null || join === undefined || join === "" ? {} : { join: String(join) };
+      mappings.push(primary === "left" ? { left: src, right: dst, ...sep } : { left: dst, right: src, ...sep });
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);
     }
   });
 
+  for (const m of mappings) {
+    const target = pathId(m[secondary]);
+    const group = mappings.filter((o) => pathId(o[secondary]) === target);
+    const join = group.find((o) => o.join !== undefined)?.join;
+    if (group.length > 1 && join !== undefined) group.forEach((o) => (o.join = join));
+    else if (group.length === 1) delete m.join;
+  }
   return { primary, data, mappings, formats: readFormats(sheets, warnings), warnings };
 }
 

@@ -20,6 +20,21 @@ export interface Mapping {
   id: string;
   left: Path;
   right: Path;
+  /**
+   * When several mappings share a target, their values are joined with this
+   * text (a space by default). Every mapping in the group carries the same value.
+   */
+  join?: string;
+}
+
+/** Separator per target (pathId) for mappings whose target is on `targetSide`. */
+export function joinsFor(mappings: Mapping[], targetSide: Side): Map<string, string> {
+  const joins = new Map<string, string>();
+  for (const m of mappings) {
+    const id = pathId(m[targetSide]);
+    if (m.join !== undefined && !joins.has(id)) joins.set(id, m.join);
+  }
+  return joins;
 }
 
 export interface FieldNode {
@@ -257,10 +272,26 @@ function assign(
  * mapping from `from` path to `to` path. Arrays are walked element by element,
  * so mapped target arrays end up the same length as the source arrays.
  */
+export const DEFAULT_JOIN = " ";
+
+/** A value as text for joining; null/missing is empty. */
+const joinText = (v: Json | undefined) =>
+  v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
+/** True when `a` is a prefix of `b` (array indexes). */
+const indexPrefix = (a: number[], b: number[]) => a.length <= b.length && a.every((n, i) => b[i] === n);
+
+/**
+ * Copy values from `source` into a clone of `template`. Mappings that share a
+ * target are combined: their values are joined with `joins.get(pathId(to))`
+ * (a space by default), skipping empty parts. Inside lists each item is joined
+ * separately, and single values are combined with every item.
+ */
 export function applyMappings(
   source: Json,
   template: Json,
   mappings: { from: Path; to: Path }[],
+  joins: Map<string, string> = new Map(),
 ): Json {
   const templates: Templates = new Map();
   let result = structuredClone(template);
@@ -285,13 +316,43 @@ export function applyMappings(
       else templates.set(outerId, cleared);
     });
   }
+  const depth = (p: Path) => p.filter((seg) => seg === ARRAY_ITEM).length;
+
+  // Group mappings by target, keeping their order (it is the join order).
+  const groups = new Map<string, { to: Path; froms: Path[] }>();
+  for (const { from, to } of mappings) {
+    const id = pathId(to);
+    if (!groups.has(id)) groups.set(id, { to, froms: [] });
+    groups.get(id)!.froms.push(from);
+  }
+  // The source with the most list levels decides how many values are written.
+  const units = [...groups.entries()].map(([id, g]) => {
+    const driver = g.froms.reduce((best, f, i) => (depth(f) > depth(g.froms[best]) ? i : best), 0);
+    return { id, ...g, driver };
+  });
+
   // Fill lists from list mappings first, so single values copied into every
   // item land on all of the items rather than on a lone placeholder.
-  const depth = (p: Path) => p.filter((seg) => seg === ARRAY_ITEM).length;
-  const ordered = [...mappings].sort((a, b) => Number(depth(a.to) > depth(a.from)) - Number(depth(b.to) > depth(b.from)));
-  for (const { from, to } of ordered) {
-    for (const { indexes, value } of collect(source, from)) {
-      result = assign(result, to, indexes, value, templates);
+  const copiesIntoList = (u: (typeof units)[number]) => Number(depth(u.to) > depth(u.froms[u.driver]));
+  units.sort((a, b) => copiesIntoList(a) - copiesIntoList(b));
+
+  for (const u of units) {
+    const sets = u.froms.map((f) => collect(source, f));
+    if (u.froms.length === 1) {
+      for (const { indexes, value } of sets[0]) result = assign(result, u.to, indexes, value, templates);
+      continue;
+    }
+    const sep = joins.get(u.id) ?? DEFAULT_JOIN;
+    for (const lead of sets[u.driver]) {
+      const parts = sets.map((set, k) => {
+        if (k === u.driver) return lead.value;
+        // The part from the same list item (or a single value shared by all items).
+        const match =
+          set.find((m) => indexPrefix(m.indexes, lead.indexes)) ?? set.find((m) => indexPrefix(lead.indexes, m.indexes));
+        return match?.value;
+      });
+      const joined = parts.map(joinText).filter((t) => t !== "").join(sep);
+      result = assign(result, u.to, lead.indexes, joined, templates);
     }
   }
   return result;
@@ -466,4 +527,9 @@ export function setValueAt(root: Json, path: Path, value: Json): Json {
   }
   if (!isObject(root) || !(head in root)) return root;
   return { ...root, [head]: setValueAt(root[head], rest, value) };
+}
+
+/** Every value at `path` (one per array item along the way), e.g. for showing examples. */
+export function valuesAt(root: Json, path: Path): Json[] {
+  return collect(root, path).map((m) => m.value);
 }

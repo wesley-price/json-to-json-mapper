@@ -34,3 +34,26 @@ body.dragging-field * {
   cursor: grabbing !important;
   user-select: none;
 }
+
+/* Printing the mapping report (app/report). Always light, A4, no app chrome. */
+@media print {
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+  :root,
+  :root[data-theme="dark"] {
+    --background: #ffffff;
+    --foreground: #18181b;
+    color-scheme: light;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-break-before {
+    break-before: page;
+  }
+  .print-avoid-break {
+    break-inside: avoid;
+  }
+}

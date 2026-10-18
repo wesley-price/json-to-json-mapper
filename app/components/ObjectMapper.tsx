@@ -19,6 +19,7 @@ import {
   findNode,
   flatten,
   isPrefix,
+  joinsFor,
   moveField,
   pathId,
   pathLabel,
@@ -28,6 +29,7 @@ import {
   setArrayItems,
   setFieldType,
   setValueAt,
+  valuesAt,
 } from "@/lib/json-tree";
 import {
   type FlatLayout,
@@ -279,20 +281,36 @@ export default function ObjectMapper() {
   };
 
   // ---------- mapping ----------
+  // A new source for a target that already has one: combine the two, or replace the old one?
+  const [pendingCombine, setPendingCombine] = useState<{ left: Path; right: Path } | null>(null);
+
+  /** Add a mapping; "combine" keeps the target's other sources (their values are joined). */
+  const addMapping = useCallback(
+    (left: Path, right: Path, mode: "combine" | "replace") =>
+      setMappings((ms) => {
+        const target = secondary === "left" ? left : right;
+        const sameTarget = (m: Mapping) => pathId(m[secondary]) === pathId(target);
+        if (mode === "replace") return [...ms.filter((m) => !sameTarget(m)), { id: newId(), left, right }];
+        const join = ms.find(sameTarget)?.join;
+        return [...ms, { id: newId(), left, right, ...(join !== undefined ? { join } : {}) }];
+      }),
+    [secondary],
+  );
+
   const createMapping = useCallback(
     (a: Selection, b: Selection) => {
       if (a.side === b.side) return;
       const left = a.side === "left" ? a.path : b.path;
       const right = a.side === "right" ? a.path : b.path;
       if (left.length === 0 || right.length === 0) return;
-      setMappings((ms) => {
-        // Each secondary field has exactly one source; replace an existing one.
-        const target = secondary === "left" ? left : right;
-        const kept = ms.filter((m) => pathId(m[secondary]) !== pathId(target));
-        return [...kept, { id: newId(), left, right }];
-      });
+      const source = primary === "left" ? left : right;
+      const target = secondary === "left" ? left : right;
+      const existing = mappings.filter((m) => pathId(m[secondary]) === pathId(target));
+      if (existing.some((m) => pathId(m[primary]) === pathId(source))) return; // already mapped
+      if (existing.length === 0) addMapping(left, right, "replace");
+      else setPendingCombine({ left, right });
     },
-    [secondary],
+    [primary, secondary, mappings, addMapping],
   );
 
   const handleSelect = (side: Side, path: Path) => {
@@ -372,8 +390,8 @@ export default function ObjectMapper() {
     setMappings((ms) => {
       const next = [...ms];
       for (const { m, index } of undo.removed) {
-        // Skip a mapping whose target has been mapped again since.
-        if (next.some((n) => pathId(n[secondary]) === pathId(m[secondary]))) continue;
+        // Skip a mapping that has been re-created since.
+        if (next.some((n) => pathId(n.left) === pathId(m.left) && pathId(n.right) === pathId(m.right))) continue;
         next.splice(Math.min(index, next.length), 0, m);
       }
       return next;
@@ -461,8 +479,27 @@ export default function ObjectMapper() {
       src,
       tpl,
       mappings.map((m) => ({ from: m[primary], to: m[secondary] })),
+      joinsFor(mappings, secondary),
     );
   }, [sides, primary, secondary, mappings]);
+
+  /** Set the separator for every mapping into the target `targetId`. */
+  const setJoin = (targetId: string, join: string) =>
+    setMappings((ms) => ms.map((m) => (pathId(m[secondary]) === targetId ? { ...m, join } : m)));
+
+  /** Move a mapping up/down among the mappings that share its target (the join order). */
+  const moveInGroup = (id: string, dir: -1 | 1) =>
+    setMappings((ms) => {
+      const i = ms.findIndex((m) => m.id === id);
+      if (i < 0) return ms;
+      const target = pathId(ms[i][secondary]);
+      let j = i + dir;
+      while (j >= 0 && j < ms.length && pathId(ms[j][secondary]) !== target) j += dir;
+      if (j < 0 || j >= ms.length) return ms;
+      const next = [...ms];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
 
   const resultText = useMemo(() => {
     if (result === null) return null;
@@ -526,14 +563,22 @@ export default function ObjectMapper() {
     }
   };
 
-  const mappingSpec = useMemo(
-    () =>
-      mappings.map((m) => ({
-        from: pathLabel(m[primary]),
-        to: pathLabel(m[secondary]),
-      })),
-    [mappings, primary, secondary],
-  );
+  const mappingSpec = useMemo(() => {
+    const groups = new Map<string, Mapping[]>();
+    for (const m of mappings) {
+      const id = pathId(m[secondary]);
+      groups.set(id, [...(groups.get(id) ?? []), m]);
+    }
+    return [...groups.values()].map((g) =>
+      g.length === 1
+        ? { from: pathLabel(g[0][primary]), to: pathLabel(g[0][secondary]) }
+        : {
+            from: g.map((m) => pathLabel(m[primary])),
+            to: pathLabel(g[0][secondary]),
+            join: g.find((m) => m.join !== undefined)?.join ?? " ",
+          },
+    );
+  }, [mappings, primary, secondary]);
 
   // ---------- connector lines ----------
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -894,8 +939,55 @@ export default function ObjectMapper() {
         hoveredIds={hoveredIds}
         onHover={(id) => setHover(id ? { ids: [id], via: "list" } : null)}
         onRemove={(id) => removeMappings([id])}
+        onSetJoin={setJoin}
+        onMoveInGroup={moveInGroup}
         onClear={() => removeMappings(mappings.map((m) => m.id))}
       />
+
+      {pendingCombine && (
+        <div
+          role="alertdialog"
+          aria-label="Combine or replace mapping"
+          className="fixed bottom-16 left-1/2 z-40 flex max-w-[90vw] -translate-x-1/2 flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-white px-4 py-2.5 text-sm text-zinc-800 shadow-lg dark:border-blue-900 dark:bg-zinc-900 dark:text-zinc-200"
+        >
+          <span>
+            <code className="font-semibold">{pathLabel(pendingCombine[secondary])}</code> already gets{" "}
+            <code>
+              {mappings
+                .filter((m) => pathId(m[secondary]) === pathId(pendingCombine[secondary]))
+                .map((m) => pathLabel(m[primary]))
+                .join(" + ")}
+            </code>
+            .
+          </span>
+          <button
+            autoFocus
+            onClick={() => {
+              addMapping(pendingCombine.left, pendingCombine.right, "combine");
+              setPendingCombine(null);
+            }}
+            className="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700"
+            title="Keep both sources; their values are joined (with a space unless you change it)"
+          >
+            ＋ Combine with {pathLabel(pendingCombine[primary])}
+          </button>
+          <button
+            onClick={() => {
+              addMapping(pendingCombine.left, pendingCombine.right, "replace");
+              setPendingCombine(null);
+            }}
+            className="rounded-md border border-zinc-300 px-2.5 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Replace
+          </button>
+          <button
+            onClick={() => setPendingCombine(null)}
+            className="text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       {undo && (
         <div
@@ -951,6 +1043,40 @@ function useStoredFlag(key: string): [boolean, (next: boolean) => void] {
   return [value, set];
 }
 
+/** Mappings grouped by target, in order of first appearance (the join order within a group). */
+function groupByTarget(mappings: Mapping[], targetSide: Side): Mapping[][] {
+  const groups = new Map<string, Mapping[]>();
+  for (const m of mappings) {
+    const id = pathId(m[targetSide]);
+    groups.set(id, [...(groups.get(id) ?? []), m]);
+  }
+  return [...groups.values()];
+}
+
+function IconAction({
+  label,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="flex h-5 w-5 items-center justify-center rounded font-sans text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 disabled:opacity-30 dark:hover:bg-zinc-700 dark:hover:text-zinc-100"
+    >
+      {children}
+    </button>
+  );
+}
+
 function HeaderButton({
   children,
   onClick,
@@ -987,6 +1113,8 @@ function OutputPanel({
   hoveredIds,
   onHover,
   onRemove,
+  onSetJoin,
+  onMoveInGroup,
   onClear,
 }: {
   mappings: Mapping[];
@@ -994,7 +1122,7 @@ function OutputPanel({
   colorFor: Map<string, string>;
   primaryTree: FieldNode | null;
   secondaryTree: FieldNode | null;
-  mappingSpec: { from: string; to: string }[];
+  mappingSpec: { from: string | string[]; to: string; join?: string }[];
   result: Json | null;
   /** The mapped result written in the target's file format. */
   resultText: string | null;
@@ -1003,6 +1131,8 @@ function OutputPanel({
   hoveredIds: string[] | null;
   onHover: (id: string | null) => void;
   onRemove: (id: string) => void;
+  onSetJoin: (targetId: string, join: string) => void;
+  onMoveInGroup: (id: string, dir: -1 | 1) => void;
   onClear: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("mappings");
@@ -1086,42 +1216,112 @@ function OutputPanel({
             <p className="text-sm text-zinc-500">No mappings yet.</p>
           ) : (
             <ul className="flex flex-col gap-1">
-              {mappings.map((m) => {
-                const from = m[primary];
-                const to = m[secondary];
-                const fromType = primaryTree && findNode(primaryTree, from)?.type;
+              {groupByTarget(mappings, secondary).map((group) => {
+                const to = group[0][secondary];
                 const toType = secondaryTree && findNode(secondaryTree, to)?.type;
-                const mismatch = fromType && toType && fromType !== toType;
-                return (
-                  <li
-                    key={m.id}
-                    onMouseEnter={() => onHover(m.id)}
-                    onMouseLeave={() => onHover(null)}
-                    className={`group flex items-center gap-2 rounded-md px-2 py-1 font-mono text-sm ${
-                      hoveredIds?.includes(m.id) ? "bg-zinc-100 dark:bg-zinc-800" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/60"
-                    }`}
-                  >
-                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: colorFor.get(m.id) }} />
-                    <span className="text-zinc-500">{primary}.</span>
-                    <span>{pathLabel(from)}</span>
-                    <span className="text-zinc-400">→</span>
-                    <span className="text-zinc-500">{secondary}.</span>
-                    <span>{pathLabel(to)}</span>
-                    {mismatch && (
-                      <span
-                        className="rounded bg-amber-100 px-1.5 font-sans text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300"
-                        title="The source and target types differ; the source value is copied as-is."
-                      >
-                        {fromType} → {toType}
-                      </span>
-                    )}
-                    <button
-                      onClick={() => onRemove(m.id)}
-                      className="ml-auto flex items-center gap-1 rounded-md border border-transparent px-2 py-0.5 font-sans text-xs text-zinc-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 dark:hover:border-red-900 dark:hover:bg-red-950 dark:hover:text-red-300"
-                      title="Remove mapping"
+                const row = (m: Mapping, i: number) => {
+                  const from = m[primary];
+                  const fromType = primaryTree && findNode(primaryTree, from)?.type;
+                  const mismatch = group.length === 1 && fromType && toType && fromType !== toType;
+                  return (
+                    <li
+                      key={m.id}
+                      onMouseEnter={() => onHover(m.id)}
+                      onMouseLeave={() => onHover(null)}
+                      className={`group flex items-center gap-2 rounded-md px-2 py-1 font-mono text-sm ${
+                        hoveredIds?.includes(m.id) ? "bg-zinc-100 dark:bg-zinc-800" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/60"
+                      }`}
                     >
-                      <span aria-hidden>×</span> Remove
-                    </button>
+                      <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: colorFor.get(m.id) }} />
+                      {group.length > 1 && <span className="w-4 text-right font-sans text-xs text-zinc-400">{i + 1}.</span>}
+                      <span className="text-zinc-500">{primary}.</span>
+                      <span>{pathLabel(from)}</span>
+                      {group.length === 1 && (
+                        <>
+                          <span className="text-zinc-400">→</span>
+                          <span className="text-zinc-500">{secondary}.</span>
+                          <span>{pathLabel(to)}</span>
+                        </>
+                      )}
+                      {mismatch && (
+                        <span
+                          className="rounded bg-amber-100 px-1.5 font-sans text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                          title="The source and target types differ; the source value is copied as-is."
+                        >
+                          {fromType} → {toType}
+                        </span>
+                      )}
+                      <span className="ml-auto flex items-center gap-1">
+                        {group.length > 1 && (
+                          <>
+                            <IconAction label="Move up" disabled={i === 0} onClick={() => onMoveInGroup(m.id, -1)}>
+                              ↑
+                            </IconAction>
+                            <IconAction label="Move down" disabled={i === group.length - 1} onClick={() => onMoveInGroup(m.id, 1)}>
+                              ↓
+                            </IconAction>
+                          </>
+                        )}
+                        <button
+                          onClick={() => onRemove(m.id)}
+                          className="flex items-center gap-1 rounded-md border border-transparent px-2 py-0.5 font-sans text-xs text-zinc-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 dark:hover:border-red-900 dark:hover:bg-red-950 dark:hover:text-red-300"
+                          title="Remove mapping"
+                        >
+                          <span aria-hidden>×</span> Remove
+                        </button>
+                      </span>
+                    </li>
+                  );
+                };
+                if (group.length === 1) return row(group[0], 0);
+
+                // Several sources combined into one target.
+                const targetId = pathId(to);
+                const join = group.find((m) => m.join !== undefined)?.join ?? " ";
+                const sample = result === null ? undefined : valuesAt(result, to)[0];
+                return (
+                  <li key={targetId} className="rounded-lg border border-zinc-200 p-1.5 dark:border-zinc-700">
+                    <div className="flex flex-wrap items-center gap-2 px-2 py-1 text-sm">
+                      <span className="text-xs font-medium text-zinc-500">Combined into</span>
+                      <span className="font-mono">
+                        <span className="text-zinc-500">{secondary}.</span>
+                        {pathLabel(to)}
+                      </span>
+                      {sample !== undefined && (
+                        <span className="truncate font-mono text-xs text-zinc-500" title="Value written (first item)">
+                          = {JSON.stringify(sample)}
+                        </span>
+                      )}
+                      <span className="ml-auto flex flex-wrap items-center gap-1 text-xs text-zinc-500">
+                        joined with
+                        <input
+                          value={join}
+                          onChange={(e) => onSetJoin(targetId, e.target.value)}
+                          aria-label={`Separator for ${pathLabel(to)}`}
+                          placeholder="nothing"
+                          className="w-16 rounded border border-zinc-300 bg-white px-1.5 py-0.5 font-mono text-xs text-zinc-800 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                        />
+                        {[
+                          [" ", "space"],
+                          [", ", "comma"],
+                          [" - ", "dash"],
+                          ["", "none"],
+                        ].map(([value, label]) => (
+                          <button
+                            key={label}
+                            onClick={() => onSetJoin(targetId, value)}
+                            className={`rounded px-1.5 py-0.5 ${
+                              join === value
+                                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                                : "hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </span>
+                    </div>
+                    <ul className="flex flex-col">{group.map(row)}</ul>
                   </li>
                 );
               })}

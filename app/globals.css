@@ -28,6 +28,15 @@ body {
   font-family: var(--font-sans);
 }
 
+/* Drawing the eye to a field (e.g. an unmapped one): three amber pulses. */
+@keyframes attention {
+  0%, 100% { box-shadow: inset 0 0 0 2px rgb(245 158 11 / 0.9), 0 0 0 0 rgb(245 158 11 / 0.6); }
+  50% { box-shadow: inset 0 0 0 2px rgb(245 158 11 / 0.9), 0 0 0 6px rgb(245 158 11 / 0); background-color: rgb(253 230 138 / 0.6); }
+}
+.attention-pulse {
+  animation: attention 0.9s ease-in-out 4;
+}
+
 /* While a field is being dragged (see app/components/drag.tsx). */
 body.dragging-field,
 body.dragging-field * {

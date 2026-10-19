@@ -5,6 +5,8 @@
 
 import { formatInfo } from "@/lib/formats";
 import { type ReportModel, describeJoin, showValues } from "./model";
+import type { Spec } from "@/lib/spec";
+import type { TestCase } from "./test-cases";
 
 // A4 portrait, in millimetres.
 const PAGE_W = 210;
@@ -47,6 +49,44 @@ export function svgHeight(svg: SVGSVGElement, width: number): number {
   return vb && vb.width ? (width * vb.height) / vb.width : 0;
 }
 
+/** A PDF being built: the jsPDF document, svg2pdf, and an off-screen host for SVG copies. */
+export interface PdfCtx {
+  doc: import("jspdf").jsPDF;
+  svg2pdf: typeof import("svg2pdf.js").svg2pdf;
+  host: HTMLElement;
+}
+
+/**
+ * Create a PDF, let `draw` fill it, add "<footer> - page i of n" to every page and save it.
+ * jsPDF and svg2pdf.js are loaded here, on demand.
+ */
+export async function buildPdf(
+  meta: { title: string; subject: string; footer: string; filename: string },
+  draw: (ctx: PdfCtx) => Promise<void>,
+): Promise<void> {
+  const [{ jsPDF }, { svg2pdf }] = await Promise.all([import("jspdf"), import("svg2pdf.js")]);
+  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
+  doc.setProperties({ title: pdfText(meta.title), subject: pdfText(meta.subject) });
+  // svg2pdf reads the SVG from the document, so converted copies are briefly attached off-screen.
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;visibility:hidden";
+  document.body.appendChild(host);
+  try {
+    await draw({ doc, svg2pdf, host });
+    const pages = doc.getNumberOfPages();
+    for (let i = 1; i <= pages; i++) {
+      doc.setPage(i);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7.5);
+      doc.setTextColor("#a1a1aa");
+      doc.text(`${pdfText(meta.footer)} - page ${i} of ${pages}`, PAGE_W / 2, PAGE_H - 7, { align: "center" });
+    }
+    doc.save(meta.filename);
+  } finally {
+    host.remove();
+  }
+}
+
 export async function downloadReportPdf(
   model: ReportModel,
   /** The rendered diagram for "overview" or a mapping id. */
@@ -56,15 +96,37 @@ export async function downloadReportPdf(
   docName = "",
 ): Promise<void> {
   const title = docName.trim() || "Mapping report";
-  const [{ jsPDF }, { svg2pdf }] = await Promise.all([import("jspdf"), import("svg2pdf.js")]);
-  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
-  doc.setProperties({ title: pdfText(title), subject: `${model.sourceTitle} to ${model.targetTitle}` });
+  await buildPdf(
+    { title, subject: `${model.sourceTitle} to ${model.targetTitle}`, footer: title, filename },
+    (ctx) =>
+      renderReportPdf(ctx, model, diagram, {
+        title,
+        kicker: docName.trim() ? "MAPPING REPORT" : undefined,
+        rules: {
+          spec: model.spec,
+          docName,
+          questions: model.unmapped.filter((u) => u.ask).map((u) => ({ field: u.label, question: u.question })),
+        },
+        testCases: model.testCases,
+      }),
+  );
+}
 
-  // svg2pdf reads the SVG from the document, so converted copies are briefly attached off-screen.
-  const host = document.createElement("div");
-  host.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;visibility:hidden";
-  document.body.appendChild(host);
-
+/** Draw the single-pair report into `ctx.doc`, starting at the top of its current (empty) page. */
+export async function renderReportPdf(
+  { doc, svg2pdf, host }: PdfCtx,
+  model: ReportModel,
+  diagram: (id: string) => SVGSVGElement | null,
+  /** The heading, the small capitals line above it, and the shared rules / test-case pages to include. */
+  opts: {
+    title: string;
+    kicker?: string;
+    rules?: { spec: Spec; docName: string; questions?: { field: string; question: string }[] };
+    testCases?: TestCase[];
+  },
+): Promise<void> {
+  const { title, kicker } = opts;
+  const { drawRulesPage, drawTestCases } = await import("./pdf-sections");
   let y = MARGIN;
   const newPage = () => {
     doc.addPage();
@@ -104,11 +166,11 @@ export async function downloadReportPdf(
     return h;
   };
 
-  try {
+  {
     // ---------- Page 1: summary + overview ----------
-    if (docName.trim()) {
+    if (kicker) {
       font("helvetica", "bold", 8, "#71717a");
-      doc.text("MAPPING REPORT", MARGIN, y + 1);
+      doc.text(pdfText(kicker), MARGIN, y + 1);
       y += 4;
     }
     font("helvetica", "bold", 20);
@@ -120,6 +182,9 @@ export async function downloadReportPdf(
       (model.combined.length ? `, ${model.combined.length} combined field${model.combined.length === 1 ? "" : "s"}` : "");
     const summary: [string, string][] = [
       ["Generated", model.generated.toLocaleString()],
+      ...(model.spec.version.trim() ? [["Version", model.spec.version.trim()] as [string, string]] : []),
+      ...(model.spec.author.trim() ? [["Author", model.spec.author.trim()] as [string, string]] : []),
+      ...(model.spec.purpose.trim() ? [["Purpose", model.spec.purpose.trim()] as [string, string]] : []),
       ["Source", `${model.sourceName !== "Source" ? `${model.sourceName} - ` : ""}${formatInfo(model.src.format).label} (${model.primary} side)`],
       ["Target", `${model.targetName !== "Target" ? `${model.targetName} - ` : ""}${formatInfo(model.dst.format).label} (${model.secondary} side)`],
       ["Mappings", mappingSummary],
@@ -138,6 +203,8 @@ export async function downloadReportPdf(
     doc.text("Overview", MARGIN, y);
     y += 3;
     y += await drawDiagram("overview", MARGIN, y, CONTENT_W, PAGE_H - MARGIN - 8 - y);
+
+    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions);
 
     // ---------- Cards (direct mappings and combined fields) ----------
     const PAD = 4;
@@ -341,11 +408,15 @@ export async function downloadReportPdf(
     doc.text("Target fields without a mapping", MARGIN, y);
     y += 5;
     if (model.unmapped.length) {
-      font("courier", "normal", 8, "#3f3f46");
-      for (const line of doc.splitTextToSize(pdfText(model.unmapped.join(", ")), CONTENT_W) as string[]) {
-        ensure(4);
-        doc.text(line, MARGIN, y);
-        y += 3.8;
+      for (const u of model.unmapped) {
+        font("helvetica", "normal", 8);
+        const text = doc.splitTextToSize(pdfText(`${u.gets}${u.decided ? "" : " (document rule)"}`), CONTENT_W - 62) as string[];
+        ensure(text.length * 3.8 + 1);
+        font("courier", "normal", 8, "#3f3f46");
+        doc.text(doc.splitTextToSize(pdfText(u.label), 58) as string[], MARGIN, y);
+        font("helvetica", "normal", 8, "#3f3f46");
+        doc.text(text, MARGIN + 62, y);
+        y += Math.max(1, text.length) * 3.8 + 0.8;
       }
     } else {
       font("helvetica", "normal", 8.5, "#71717a");
@@ -383,17 +454,6 @@ export async function downloadReportPdf(
         y += 3.1;
       }
     }
-
-    // Page numbers.
-    const pages = doc.getNumberOfPages();
-    for (let i = 1; i <= pages; i++) {
-      doc.setPage(i);
-      font("helvetica", "normal", 7.5, "#a1a1aa");
-      doc.text(`${pdfText(title)} - page ${i} of ${pages}`, PAGE_W / 2, PAGE_H - 7, { align: "center" });
-    }
-
-    doc.save(filename);
-  } finally {
-    host.remove();
+    if (opts.testCases) drawTestCases(doc, opts.testCases);
   }
 }

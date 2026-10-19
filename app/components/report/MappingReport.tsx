@@ -11,6 +11,9 @@ import Link from "next/link";
 import { dateStamp, fileSlug } from "@/lib/names";
 import { MultiReport } from "./MultiReport";
 import { type SavedMulti, buildMultiReport } from "./multi-model";
+import { type ScenarioReport, allTestCases, buildScenarioReports } from "./scenario-model";
+import { RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
+import { testCasesFile } from "./test-cases";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { formatInfo } from "@/lib/formats";
 import { pathId } from "@/lib/json-tree";
@@ -63,7 +66,7 @@ function Notes({ notes }: { notes: string[] }) {
   );
 }
 
-function SingleCard({ m, report }: { m: ReportMapping; report: ReportModel }) {
+function SingleCard({ m, report, prefix }: { m: ReportMapping; report: ReportModel; prefix: string }) {
   return (
     <article className="print-avoid-break rounded-lg border border-zinc-200 p-4">
       <h3 className="mb-3 flex items-center gap-2 font-mono text-sm font-semibold">
@@ -71,7 +74,7 @@ function SingleCard({ m, report }: { m: ReportMapping; report: ReportModel }) {
         {m.fromLabel} <span className="text-zinc-400">→</span> {m.toLabel}
       </h3>
       <MappingDiagram
-        diagramId={m.id}
+        diagramId={prefix + m.id}
         source={m.constant !== undefined ? [constantRow(m.from, m.constant, m.db)] : excerptRows(report.src.tree, m.from)}
         target={excerptRows(report.dst.tree, m.to)}
         links={[{ from: pathId(m.from), to: pathId(m.to), color: m.color }]}
@@ -107,7 +110,7 @@ function SingleCard({ m, report }: { m: ReportMapping; report: ReportModel }) {
   );
 }
 
-function CombinedCard({ c, report }: { c: ReportCombined; report: ReportModel }) {
+function CombinedCard({ c, report, prefix }: { c: ReportCombined; report: ReportModel; prefix: string }) {
   return (
     <article className="print-avoid-break rounded-lg border border-zinc-200 p-4">
       <h3 className="mb-3 flex flex-wrap items-center gap-2 font-mono text-sm font-semibold">
@@ -118,7 +121,7 @@ function CombinedCard({ c, report }: { c: ReportCombined; report: ReportModel })
         </span>
       </h3>
       <MappingDiagram
-        diagramId={c.id}
+        diagramId={prefix + c.id}
         source={[
           ...excerptRowsMany(
             report.src.tree,
@@ -168,30 +171,37 @@ function CombinedCard({ c, report }: { c: ReportCombined; report: ReportModel })
 export function MappingReport() {
   const raw = useSyncExternalStore(subscribe, readSaved, () => null);
   // Multi-source mode gets its own report; otherwise the single-pair one.
-  const { report, multiReport, docName } = useMemo(() => {
-    const none = { report: null, multiReport: null, docName: "" };
+  // Several scenarios get one combined report.
+  const { report, multiReport, scenarios, docName } = useMemo(() => {
+    const none = { report: null, multiReport: null, scenarios: null, docName: "" };
     if (!raw) return none;
     try {
-      const saved = JSON.parse(raw) as Saved & SavedMulti;
+      const saved = JSON.parse(raw) as Saved & SavedMulti & Parameters<typeof buildScenarioReports>[0];
       const name = (saved.docName ?? "").trim();
-      if (saved.multi?.enabled) return { report: null, multiReport: buildMultiReport(saved), docName: name };
-      return { report: buildReport(saved), multiReport: null, docName: name };
+      const scenarios = buildScenarioReports(saved);
+      if (scenarios) return { ...none, scenarios, docName: name };
+      if (saved.multi?.enabled) return { ...none, multiReport: buildMultiReport(saved), docName: name };
+      return { ...none, report: buildReport(saved), docName: name };
     } catch {
       return none;
     }
   }, [raw]);
-  const generated = report?.generated ?? multiReport?.generated ?? null;
+  const generated = report?.generated ?? multiReport?.generated ?? scenarios?.[0].generated ?? null;
+  const hasReport = !!(report || multiReport || scenarios);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const [pdfState, setPdfState] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
 
   const downloadPdf = async () => {
-    if ((!report && !multiReport) || !generated || pdfState.busy) return;
+    if (!hasReport || !generated || pdfState.busy) return;
     setPdfState({ busy: true, error: null });
     const diagram = (id: string) =>
       rootRef.current?.querySelector<SVGSVGElement>(`svg[data-diagram="${CSS.escape(id)}"]`) ?? null;
     try {
-      if (multiReport) {
+      if (scenarios) {
+        const { downloadScenariosPdf } = await import("./pdf-scenarios");
+        await downloadScenariosPdf(scenarios, diagram, fileName(docName, generated), docName, generated);
+      } else if (multiReport) {
         const { downloadMultiReportPdf } = await import("./pdf-multi");
         await downloadMultiReportPdf(multiReport, diagram, fileName(docName, generated));
       } else if (report) {
@@ -208,15 +218,15 @@ export function MappingReport() {
   // so a refresh doesn't download again.
   const autoStarted = useRef(false);
   useEffect(() => {
-    if ((!report && !multiReport) || autoStarted.current || !new URLSearchParams(window.location.search).has("download")) return;
+    if (!hasReport || autoStarted.current || !new URLSearchParams(window.location.search).has("download")) return;
     autoStarted.current = true;
     window.history.replaceState(null, "", window.location.pathname);
     void downloadPdf();
     // downloadPdf reads the latest report; running once per page load is intended
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [report, multiReport]);
+  }, [report, multiReport, scenarios]);
 
-  if (!report && !multiReport) {
+  if (!hasReport) {
     return (
       <div className="mx-auto max-w-2xl p-10 text-zinc-800">
         <h1 className="text-xl font-semibold">Mapping report</h1>
@@ -231,6 +241,19 @@ export function MappingReport() {
     );
   }
 
+  const downloadTestCases = () => {
+    const cases = report?.testCases ?? multiReport?.testCases ?? (scenarios ? allTestCases(scenarios) : []);
+    const spec = report?.spec ?? multiReport?.spec ?? scenarios?.map((s) => s.single?.spec ?? s.multi?.spec).find(Boolean);
+    const url = URL.createObjectURL(
+      new Blob([testCasesFile(docName, spec?.version.trim() ?? "", cases)], { type: "application/json" }),
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${fileSlug(docName, "mapping")}-test-cases.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const toolbar = (
       <div className="no-print sticky top-0 z-10 -mx-10 mb-6 flex flex-wrap items-center gap-3 border-b border-zinc-200 bg-white/95 px-10 py-3 backdrop-blur">
         <Link href="/" className="text-sm text-blue-600 hover:underline">
@@ -238,6 +261,13 @@ export function MappingReport() {
         </Link>
         {pdfState.error && <span className="text-sm text-red-600">{pdfState.error}</span>}
         <div className="ml-auto flex gap-2">
+          <button
+            onClick={downloadTestCases}
+            className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100"
+            title="Every input with its expected output, as JSON for unit tests"
+          >
+            ⬇ Test cases (JSON)
+          </button>
           <button
             onClick={() => window.print()}
             className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100"
@@ -260,23 +290,131 @@ export function MappingReport() {
     return (
       <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
         {toolbar}
-        <MultiReport report={multiReport} />
+        <MultiReport report={multiReport} docName={docName} />
+      </div>
+    );
+  }
+  if (scenarios) {
+    return (
+      <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
+        {toolbar}
+        <ScenariosReport scenarios={scenarios} docName={docName} generated={scenarios[0].generated} />
       </div>
     );
   }
   if (!report) return null;
-  const { src, dst, singles, combined, entries } = report;
-
   return (
     <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
       {toolbar}
-      {/* 1. Overview */}
+      <SingleReport report={report} kicker={docName ? "Mapping report" : undefined} title={docName || "Mapping report"} docName={docName} />
+    </div>
+  );
+}
+
+/** Every scenario in one report: a contents page, then each scenario's own report. */
+function ScenariosReport({ scenarios, docName, generated }: { scenarios: ScenarioReport[]; docName: string; generated: Date }) {
+  const total = scenarios.length;
+  const spec = scenarios.map((s) => s.single?.spec ?? s.multi?.spec).find(Boolean);
+  return (
+    <>
       <section>
-        {docName && <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Mapping report</p>}
+        <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Mapping report · {total} scenarios</p>
         <h1 className="text-2xl font-semibold tracking-tight">{docName || "Mapping report"}</h1>
         <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-sm">
           <dt className="text-zinc-500">Generated</dt>
+          <dd>{generated.toLocaleString()}</dd>
+          {spec && <SpecRows spec={spec} />}
+          <dt className="text-zinc-500">Scenarios</dt>
+          <dd>{total}</dd>
+        </dl>
+        <h2 className="mt-6 mb-2 text-base font-semibold">Scenarios</h2>
+        <table className="w-full text-left text-xs">
+          <thead className="text-zinc-500">
+            <tr>
+              <th className="py-1 font-normal">#</th>
+              <th className="py-1 font-normal">Scenario</th>
+              <th className="py-1 font-normal">Kind</th>
+              <th className="py-1 font-normal">Objects</th>
+              <th className="py-1 font-normal">Mappings</th>
+            </tr>
+          </thead>
+          <tbody>
+            {scenarios.map((sc) => (
+              <tr key={sc.n} className="border-t border-zinc-100 align-top">
+                <td className="py-1 pr-2">{sc.n}</td>
+                <td className="py-1 pr-2 font-medium">{sc.name}</td>
+                <td className="py-1 pr-2">{sc.multi ? "Multi-source" : "Single pair"}</td>
+                <td className="py-1 pr-2">{sc.objects.replace("->", "→").replace("<-", "←")}</td>
+                <td className="py-1">{sc.counts.replace(/ - /g, " · ")}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+      {spec && (
+        <RulesSection
+          spec={spec}
+          docName={docName}
+          questions={scenarios.flatMap((sc) =>
+            (sc.single
+              ? sc.single.unmapped.filter((u) => u.ask).map((u) => ({ field: u.label, question: u.question }))
+              : (sc.multi?.openQuestions ?? [])
+            ).map((q) => ({ ...q, scenario: sc.name })),
+          )}
+        />
+      )}
+
+      {scenarios.map((sc) => {
+        const kicker = `Scenario ${sc.n} of ${total}${sc.multi ? " · multi-source" : ""}`;
+        return (
+          <div key={sc.n} className="print-break-before mt-14 border-t-4 border-zinc-900 pt-6 print:mt-0 print:border-t-0 print:pt-0">
+            {sc.multi ? (
+              <MultiReport report={sc.multi} kicker={kicker} title={sc.name} prefix={sc.prefix} sections={false} />
+            ) : sc.single ? (
+              <SingleReport report={sc.single} kicker={kicker} title={sc.name} prefix={sc.prefix} sections={false} />
+            ) : (
+              <section>
+                <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{kicker}</p>
+                <h1 className="text-2xl font-semibold tracking-tight">{sc.name}</h1>
+                <p className="mt-2 text-sm text-zinc-500">Nothing to report yet: this scenario needs both objects.</p>
+              </section>
+            )}
+          </div>
+        );
+      })}
+      <TestCasesSection cases={allTestCases(scenarios)} />
+    </>
+  );
+}
+
+/** The single-pair report body. `prefix` keeps diagram ids unique when several reports share the page. */
+function SingleReport({
+  report,
+  kicker,
+  title,
+  prefix = "",
+  docName = "",
+  sections = true,
+}: {
+  report: ReportModel;
+  kicker?: string;
+  title: string;
+  prefix?: string;
+  docName?: string;
+  /** Include the spec details, rules page and test cases (off inside a scenarios report, which has them once). */
+  sections?: boolean;
+}) {
+  const { src, dst, singles, combined, entries } = report;
+  return (
+    <>
+      {/* 1. Overview */}
+      <section>
+        {kicker && <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{kicker}</p>}
+        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-sm">
+          <dt className="text-zinc-500">Generated</dt>
           <dd>{report.generated.toLocaleString()}</dd>
+          {sections && <SpecRows spec={report.spec} />}
           <dt className="text-zinc-500">Source</dt>
           <dd>
             {report.sourceName !== "Source" && <span className="font-medium">{report.sourceName} · </span>}
@@ -300,7 +438,7 @@ export function MappingReport() {
 
         <h2 className="mt-6 mb-2 text-base font-semibold">Overview</h2>
         <MappingDiagram
-          diagramId="overview"
+          diagramId={prefix + "overview"}
           source={[
             ...allRows(src.tree),
             // Constants have no source field; list them after the source tree so their lines have a start.
@@ -317,13 +455,21 @@ export function MappingReport() {
         />
       </section>
 
+      {sections && (
+        <RulesSection
+          spec={report.spec}
+          docName={docName}
+          questions={report.unmapped.filter((u) => u.ask).map((u) => ({ field: u.label, question: u.question }))}
+        />
+      )}
+
       {/* 2. Direct mappings */}
       {singles.length > 0 && (
         <section className="print-break-before mt-10">
           <h2 className="mb-3 text-lg font-semibold">Mappings in detail</h2>
           <div className="flex flex-col gap-6">
             {singles.map((m) => (
-              <SingleCard key={m.id} m={m} report={report} />
+              <SingleCard key={m.id} m={m} report={report} prefix={prefix} />
             ))}
           </div>
         </section>
@@ -338,7 +484,7 @@ export function MappingReport() {
           </p>
           <div className="flex flex-col gap-6">
             {combined.map((c) => (
-              <CombinedCard key={c.id} c={c} report={report} />
+              <CombinedCard key={c.id} c={c} report={report} prefix={prefix} />
             ))}
           </div>
         </section>
@@ -394,7 +540,19 @@ export function MappingReport() {
 
         <h3 className="mt-5 mb-1 text-sm font-semibold">Target fields without a mapping</h3>
         {report.unmapped.length ? (
-          <p className="font-mono text-xs leading-relaxed text-zinc-700">{report.unmapped.join(", ")}</p>
+          <table className="w-full text-left text-xs">
+            <tbody>
+              {report.unmapped.map((u) => (
+                <tr key={u.label} className="border-t border-zinc-100 align-top">
+                  <td className="py-1 pr-3 font-mono">{u.label}</td>
+                  <td className="py-1 text-zinc-700">
+                    {u.gets}
+                    {!u.decided && <span className="text-zinc-400"> (document rule)</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         ) : (
           <p className="text-xs text-zinc-500">Every target field is mapped.</p>
         )}
@@ -413,6 +571,7 @@ export function MappingReport() {
           {report.resultText}
         </pre>
       </section>
-    </div>
+      {sections && <TestCasesSection cases={report.testCases} />}
+    </>
   );
 }

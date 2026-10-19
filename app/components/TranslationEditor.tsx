@@ -140,7 +140,7 @@ export function ConstantForm({
   onCancel: () => void;
 }) {
   const [target, setTarget] = useState(fields[0] ? pathId(fields[0]) : "");
-  const [draft, setDraft] = useState<ConstantDraft>({ kind: "value", value: "", table: "", column: "" });
+  const [draft, setDraft] = useState<ConstantDraft>({ kind: "value", value: "", table: "", column: "", where: "" });
   const submit = () => {
     if (target) onAdd(JSON.parse(target) as Path, fromDraft(draft));
   };
@@ -190,18 +190,20 @@ export interface ConstantDraft {
   value: string;
   table: string;
   column: string;
+  /** Which row to read (the lookup key), e.g. "code = errorCode". */
+  where: string;
 }
 
 export function draftOf(value: Json | undefined, db?: DbRef): ConstantDraft {
   const text = value === undefined || value === null ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
-  return { kind: db ? "db" : "value", value: text, table: db?.table ?? "", column: db?.column ?? "" };
+  return { kind: db ? "db" : "value", value: text, table: db?.table ?? "", column: db?.column ?? "", where: db?.where ?? "" };
 }
 
 /** The constant a draft describes. Numbers and true/false become real numbers/booleans. */
 export function fromDraft(d: ConstantDraft): { value: Json; db?: DbRef } {
   // Not trimmed here: this runs on every keystroke, and trimming would swallow typed spaces.
   const value = inferScalar(d.value);
-  return d.kind === "db" ? { value, db: { table: d.table, column: d.column } } : { value };
+  return d.kind === "db" ? { value, db: { table: d.table, column: d.column, ...(d.where ? { where: d.where } : {}) } } : { value };
 }
 
 /** Hardcoded | Database switch plus the matching inputs. */
@@ -251,6 +253,15 @@ export function ConstantFields({ draft, onChange }: { draft: ConstantDraft; onCh
             placeholder="column"
             aria-label="Database column"
             className={`${inputClass} w-28`}
+          />
+          <span className="text-zinc-500">where</span>
+          <input
+            value={draft.where}
+            onChange={(e) => set({ where: e.target.value })}
+            placeholder="code = errorCode"
+            aria-label="Database lookup"
+            title="Which row to read: the key column and the source field (or value) it matches"
+            className={`${inputClass} w-40 ${draft.where.trim() ? "" : "border-amber-400 dark:border-amber-600"}`}
           />
           <input
             value={draft.value}

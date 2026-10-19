@@ -12,12 +12,15 @@
 //   Cases      Source # | Case # | Case name | Conditions | Conditions (JSON)   (check order)
 //   Mappings   Source # | Case # | Source field | Standard field | Source type | Standard type
 //              | Join with | Constant value | Translation | Constant from database
+//   Values     Object | Field | Value | Type   (more values a source field can carry; Object = S1, S2…)
+//   Examples   Source # | Example # | Example name | Field | Value | Type
+//              (more messages of a source: only the values that differ from its sample)
 
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
 import { type Headers, HEADERS, lookupTree, supportsHeaders } from "./headers";
 import { type Json, type Path, allPaths, buildTree, findNode, flatten, parsePathLabel, pathId, pathLabel } from "./json-tree";
 import { type Condition, describeConditions } from "./multi";
-import { type DbRef, type FixedValues, type Translation, isConstPath, newConstPath } from "./transforms";
+import { type DbRef, type FixedValues, type Translation, formatDbRef, isConstPath, newConstPath, parseDbRef } from "./transforms";
 import { fixedCell, flatRow, flatSheet, readFixedCell, readFlatSheet, toJson } from "./workbook";
 import type { Cell, Sheet } from "./xlsx";
 
@@ -31,6 +34,8 @@ export interface MultiDocSide {
   layout: FlatLayout;
   headers: Headers;
   fixed: FixedValues;
+  /** More values a field can carry (pathId -> values), e.g. other messages for the same error. */
+  moreValues?: Record<string, Json[]>;
 }
 
 /** A mapping from a source field (or constant) into a standard field. */
@@ -41,6 +46,7 @@ export interface MultiDocMapping {
   constant?: Json;
   db?: DbRef;
   translate?: Translation;
+  note?: string;
 }
 
 export interface MultiDoc {
@@ -49,8 +55,15 @@ export interface MultiDoc {
   sources: {
     name: string;
     side: MultiDocSide;
-    cases: { name: string; when: Condition[]; mappings: MultiDocMapping[] }[];
+    cases: { name: string; when: Condition[]; mappings: MultiDocMapping[]; note?: string }[];
+    /** More messages of the same object: only the values that differ from the sample. */
+    examples?: MultiDocExample[];
   }[];
+}
+
+export interface MultiDocExample {
+  name: string;
+  values: { path: Path; value: Json }[];
 }
 
 /** Optional extras computed by the app (they are not read back on import). */
@@ -136,7 +149,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
   const headerRows = (object: string, side: MultiDocSide): Cell[][] =>
     Object.entries(side.headers ?? {}).map(([name, value]) => {
       const [, cell, type] = flatRow(name, value);
-      return [object, name, cell, type, fixedCell(side.fixed?.[pathId([HEADERS, name])])];
+      return [object, name, cell, type, fixedCell(side.fixed?.[pathId([HEADERS, name])], value)];
     });
   sheets.push({
     name: "Headers",
@@ -150,12 +163,42 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
   sheets.push({
     name: "Cases",
     rows: [
-      ["Source #", "Case #", "Case name", "Conditions", "Conditions (JSON)"],
+      ["Source #", "Case #", "Case name", "Conditions", "Conditions (JSON)", "Notes"],
       ...doc.sources.flatMap((s, i) =>
-        s.cases.map((c, j): Cell[] => [i + 1, j + 1, c.name, describeConditions(c.when, pathLabel), JSON.stringify(c.when)]),
+        s.cases.map((c, j): Cell[] => [i + 1, j + 1, c.name, describeConditions(c.when, pathLabel), JSON.stringify(c.when), c.note ?? ""]),
       ),
     ],
   });
+
+  if (doc.sources.some((src) => Object.keys(src.side.moreValues ?? {}).length)) {
+    sheets.push({
+      name: "Values",
+      rows: [
+        ["Object", "Field", "Value", "Type"],
+        ...doc.sources.flatMap((src, i) =>
+          Object.entries(src.side.moreValues ?? {}).flatMap(([id, values]) =>
+            values.map((v): Cell[] => [objectLabel(i + 1), ...flatRow(pathLabel(JSON.parse(id) as Path), v)]),
+          ),
+        ),
+      ],
+    });
+  }
+
+  if (doc.sources.some((src) => src.examples?.length)) {
+    sheets.push({
+      name: "Examples",
+      rows: [
+        ["Source #", "Example #", "Example name", "Field", "Value", "Type"],
+        ...doc.sources.flatMap((src, i) =>
+          (src.examples ?? []).flatMap((ex, j): Cell[][] =>
+            ex.values.length
+              ? ex.values.map((v) => [i + 1, j + 1, ex.name, ...flatRow(pathLabel(v.path), v.value)])
+              : [[i + 1, j + 1, ex.name, "", "", ""]],
+          ),
+        ),
+      ],
+    });
+  }
 
   sheets.push({
     name: "Mappings",
@@ -171,6 +214,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
         "Constant value",
         "Translation",
         "Constant from database",
+        "Notes",
       ],
       ...doc.sources.flatMap((s, i) => {
         const srcTree = fieldsOf(s.side);
@@ -188,7 +232,8 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
               combined ? (m.join ?? " ") : "",
               m.constant === undefined ? "" : typeof m.constant === "object" && m.constant !== null ? JSON.stringify(m.constant) : m.constant,
               m.translate ? JSON.stringify(m.translate) : "",
-              m.db ? `${m.db.table}.${m.db.column}` : "",
+              m.db ? formatDbRef(m.db) : "",
+              m.note ?? "",
             ];
           }),
         );
@@ -271,7 +316,13 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
     } catch {
       warnings.push(`Cases row ${i + 2}: the conditions couldn't be read, so this case always matches.`);
     }
-    src.cases[(Number(row[1]) || src.cases.length + 1) - 1] = { name: String(row[2] ?? "").trim() || "Case", when, mappings: [] };
+    const note = String(row[5] ?? "").trim();
+    src.cases[(Number(row[1]) || src.cases.length + 1) - 1] = {
+      name: String(row[2] ?? "").trim() || "Case",
+      when,
+      mappings: [],
+      ...(note ? { note: String(row[5]) } : {}),
+    };
   });
   for (const src of sources) {
     if (!src) continue;
@@ -288,7 +339,7 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
       return seg;
     });
   (byName("Mappings")?.rows.slice(1) ?? []).forEach((row, i) => {
-    const [srcNo, caseNo, fromCell, toCell, , , join, constantCell, translationCell, dbCell] = row;
+    const [srcNo, caseNo, fromCell, toCell, , , join, constantCell, translationCell, dbCell, noteCell] = row;
     if (fromCell === null && toCell === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -306,9 +357,7 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
       if (join !== null && join !== undefined && join !== "") m.join = String(join);
       if (isConst) m.constant = (constantCell ?? "") as Json;
       if (isConst && dbCell !== null && dbCell !== undefined && String(dbCell).trim()) {
-        const ref = String(dbCell).trim();
-        const dot = ref.lastIndexOf(".");
-        m.db = { table: dot < 0 ? ref : ref.slice(0, dot), column: dot < 0 ? "" : ref.slice(dot + 1) };
+        m.db = parseDbRef(String(dbCell));
       }
       if (translationCell !== null && translationCell !== undefined && String(translationCell).trim()) {
         try {
@@ -317,11 +366,44 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
           warnings.push(`${where}: the Translation column couldn't be read, so it was left out.`);
         }
       }
+      if (noteCell !== null && noteCell !== undefined && String(noteCell).trim()) m.note = String(noteCell);
       kase.mappings.push(m);
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);
     }
   });
+
+  // More values per source field.
+  (byName("Values")?.rows.slice(1) ?? []).forEach((row, i) => {
+    const [objectCell, fieldCell, valueCell, typeCell] = row;
+    const n = Number(/^S(\d+)$/i.exec(String(objectCell ?? "").trim())?.[1] ?? 0);
+    const src = sources[n - 1];
+    if (!src || fieldCell === null || String(fieldCell).trim() === "") return;
+    try {
+      const id = pathId(toPath(fieldCell));
+      const more = (src.side.moreValues ??= {});
+      (more[id] ??= []).push(toJson(valueCell ?? null, typeCell ?? null));
+    } catch (e) {
+      warnings.push(`Values row ${i + 2}: ${(e as Error).message}`);
+    }
+  });
+
+  // Examples: rows grouped by source # and example #.
+  (byName("Examples")?.rows.slice(1) ?? []).forEach((row, i) => {
+    const [srcNo, exNo, nameCell, fieldCell, valueCell, typeCell] = row;
+    const src = sources[(Number(srcNo) || 0) - 1];
+    if (!src) return;
+    const examples = (src.examples ??= []);
+    const j = (Number(exNo) || examples.length + 1) - 1;
+    const ex = (examples[j] ??= { name: String(nameCell ?? "").trim() || `Example ${j + 2}`, values: [] });
+    if (fieldCell === null || String(fieldCell).trim() === "") return;
+    try {
+      ex.values.push({ path: toPath(fieldCell), value: toJson(valueCell ?? null, typeCell ?? null) });
+    } catch (e) {
+      warnings.push(`Examples row ${i + 2}: ${(e as Error).message}`);
+    }
+  });
+  for (const src of sources) if (src?.examples) src.examples = src.examples.filter(Boolean);
 
   return {
     doc: { docName: String(prop("Name") ?? "").trim(), standard, sources: sources.filter(Boolean) },

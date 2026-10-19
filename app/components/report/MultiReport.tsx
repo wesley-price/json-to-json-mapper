@@ -7,8 +7,9 @@
 import { formatInfo } from "@/lib/formats";
 import { MappingDiagram, allRows, constantRow } from "./MappingDiagram";
 import type { MultiReportModel, MultiReportSource } from "./multi-model";
+import { RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
 
-function SourceSection({ src, report }: { src: MultiReportSource; report: MultiReportModel }) {
+function SourceSection({ src, report, prefix }: { src: MultiReportSource; report: MultiReportModel; prefix: string }) {
   const sourceTitle = `${src.name} · ${formatInfo(src.format).label}`;
   return (
     <section className="print-break-before mt-10">
@@ -49,8 +50,9 @@ function SourceSection({ src, report }: { src: MultiReportSource; report: MultiR
               {c.usedBySample && <span className="ml-2 text-xs font-normal text-emerald-700">● used by the sample</span>}
             </h3>
             <p className="mb-3 font-mono text-xs text-zinc-600">when {c.conditions}</p>
+            {c.note && <p className="mb-3 whitespace-pre-wrap text-xs text-sky-800">💬 {c.note}</p>}
             <MappingDiagram
-              diagramId={c.id}
+              diagramId={prefix + c.id}
               source={[
                 ...allRows(src.tree),
                 ...c.mappings.filter((m) => m.constant !== undefined).map((m) => constantRow(m.from, m.constant, m.db)),
@@ -106,19 +108,104 @@ function SourceSection({ src, report }: { src: MultiReportSource; report: MultiR
           </pre>
         </>
       )}
+
+      {src.moreValues.length > 0 && (
+        <>
+          <h3 className="mt-5 mb-1 text-sm font-semibold">More values</h3>
+          <p className="mb-2 text-xs text-zinc-500">Other values these fields can carry, each checked against the cases.</p>
+          <table className="mb-3 w-full text-left text-xs">
+            <thead className="text-zinc-500">
+              <tr>
+                <th className="py-1 font-normal">Field</th>
+                <th className="py-1 font-normal">Value</th>
+                <th className="py-1 font-normal">Case used</th>
+              </tr>
+            </thead>
+            <tbody>
+              {src.moreValues.map((m, i) => (
+                <tr key={i} className="border-t border-zinc-100 align-top">
+                  <td className="py-1 pr-2 font-mono">{m.field}</td>
+                  <td className="py-1 pr-2 font-mono">{m.value}</td>
+                  <td className={`py-1 ${m.sameCase ? "" : "bg-amber-50 text-amber-700"}`}>
+                    {m.caseName}
+                    {!m.sameCase && " (not the sample's case)"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {src.examples.length > 0 && (
+        <>
+          <h3 className="mt-5 mb-1 text-sm font-semibold">Other examples</h3>
+          <p className="mb-2 text-xs text-zinc-500">More messages of the same object; only the values listed differ from the sample.</p>
+          <table className="mb-3 w-full text-left text-xs">
+            <thead className="text-zinc-500">
+              <tr>
+                <th className="py-1 font-normal">Example</th>
+                <th className="py-1 font-normal">Values that differ from the sample</th>
+                <th className="py-1 font-normal">Case used</th>
+              </tr>
+            </thead>
+            <tbody>
+              {src.examples.map((ex) => (
+                <tr key={ex.name} className="border-t border-zinc-100 align-top">
+                  <td className="py-1 pr-2 font-medium">{ex.name}</td>
+                  <td className="py-1 pr-2 font-mono">{ex.changes}</td>
+                  <td className={`py-1 ${"error" in ex.test ? "text-amber-700" : ""}`}>
+                    {"error" in ex.test ? ex.test.error : ex.test.caseName}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {src.examples.map((ex) =>
+            "error" in ex.test ? null : (
+              <div key={ex.name} className="print-avoid-break mb-3">
+                <p className="mb-1 text-xs font-medium">
+                  {ex.name} <span className="font-normal text-zinc-500">· case “{ex.test.caseName}”</span>
+                </p>
+                <pre className="whitespace-pre-wrap break-all rounded-md border border-zinc-200 bg-zinc-50 p-3 font-mono text-[10px] leading-snug">
+                  {ex.test.text}
+                </pre>
+              </div>
+            ),
+          )}
+        </>
+      )}
     </section>
   );
 }
 
-export function MultiReport({ report }: { report: MultiReportModel }) {
+export function MultiReport({
+  report,
+  kicker = "Multi-source mapping report",
+  title = report.docName || "Mapping report",
+  prefix = "",
+  docName = "",
+  sections = true,
+}: {
+  report: MultiReportModel;
+  docName?: string;
+  /** Include the spec details, rules page and test cases (off inside a scenarios report, which has them once). */
+  sections?: boolean;
+  /** The small capitals line above the title. */
+  kicker?: string;
+  title?: string;
+  /** Keeps diagram ids unique when several reports share the page. */
+  prefix?: string;
+}) {
   return (
     <>
       <section>
-        <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Multi-source mapping report</p>
-        <h1 className="text-2xl font-semibold tracking-tight">{report.docName || "Mapping report"}</h1>
+        <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{kicker}</p>
+        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
         <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-sm">
           <dt className="text-zinc-500">Generated</dt>
           <dd>{report.generated.toLocaleString()}</dd>
+          {sections && <SpecRows spec={report.spec} />}
           <dt className="text-zinc-500">Standard</dt>
           <dd>
             {report.standard.name !== "Standard" && <span className="font-medium">{report.standard.name} · </span>}
@@ -132,6 +219,14 @@ export function MultiReport({ report }: { report: MultiReportModel }) {
           </dd>
           <dt className="text-zinc-500">Coverage gaps</dt>
           <dd>{report.gapCount}</dd>
+          {report.standardConstants.length > 0 && (
+            <>
+              <dt className="text-zinc-500">Constants</dt>
+              <dd className="font-mono text-xs leading-6">
+                {report.standardConstants.map((c) => `${c.label} = ${c.text}`).join(", ")}
+              </dd>
+            </>
+          )}
         </dl>
 
         <h2 className="mt-6 mb-2 text-base font-semibold">Coverage</h2>
@@ -162,9 +257,12 @@ export function MultiReport({ report }: { report: MultiReportModel }) {
         </table>
       </section>
 
+      {sections && <RulesSection spec={report.spec} docName={docName} questions={report.openQuestions} />}
+
       {report.sources.map((src) => (
-        <SourceSection key={src.n} src={src} report={report} />
+        <SourceSection key={src.n} src={src} report={report} prefix={prefix} />
       ))}
+      {sections && <TestCasesSection cases={report.testCases} />}
     </>
   );
 }

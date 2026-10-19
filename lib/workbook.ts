@@ -28,7 +28,7 @@ import {
 } from "./json-tree";
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
 import { type Headers, lookupTree, supportsHeaders } from "./headers";
-import { type DbRef, type Fixed, type FixedValues, type Translation, isConstPath, newConstPath } from "./transforms";
+import { type DbRef, type Fixed, type FixedValues, type Translation, formatDbRef, isConstPath, newConstPath, parseDbRef } from "./transforms";
 import { inferScalar } from "./formats/xml";
 import type { Cell, Sheet } from "./xlsx";
 
@@ -47,14 +47,21 @@ export function flatRow(field: string, value: Json): Cell[] {
 }
 
 /**
- * "yes" for a hardcoded tag (its value is the field value), or
- * "db:table.column" plus "=sample" when a database tag has a sample value.
+ * "yes" for a hardcoded tag whose value is the field value, "yes=<value>" when
+ * the constant differs from the field value, or
+ * "db:table.column" plus "=sample" when a database tag has a sample value. With a
+ * lookup key: "db:table.column where code = errorCode" plus " ;sample=<value>".
  */
-export function fixedCell(fixed: Fixed | undefined): Cell {
+export function fixedCell(fixed: Fixed | undefined, fieldValue?: Json): Cell {
   if (!fixed) return "";
-  if (!fixed.db) return "yes";
-  const sample = fixed.value === null || fixed.value === undefined || fixed.value === "" ? "" : `=${typeof fixed.value === "object" ? JSON.stringify(fixed.value) : fixed.value}`;
-  return `db:${fixed.db.table}.${fixed.db.column}${sample}`;
+  if (!fixed.db) {
+    if (fieldValue === undefined || JSON.stringify(fixed.value) === JSON.stringify(fieldValue)) return "yes";
+    return `yes=${typeof fixed.value === "string" ? fixed.value : JSON.stringify(fixed.value)}`;
+  }
+  const raw = fixed.value === null || fixed.value === undefined || fixed.value === "" ? "" : typeof fixed.value === "object" ? JSON.stringify(fixed.value) : String(fixed.value);
+  // A lookup key can contain "=", so the sample then gets its own marker.
+  if (fixed.db.where?.trim()) return `db:${formatDbRef(fixed.db)}${raw ? ` ;sample=${raw}` : ""}`;
+  return `db:${fixed.db.table}.${fixed.db.column}${raw ? `=${raw}` : ""}`;
 }
 
 /** Read a Constant cell back ("yes" / "db:table.column"); undefined when not tagged. */
@@ -62,15 +69,22 @@ export function readFixedCell(cell: Cell, fieldValue: Json): Fixed | undefined {
   let value = fieldValue;
   const text = String(cell ?? "").trim();
   if (!text || /^(no|false|0)$/i.test(text)) return undefined;
-  const db = /^db:([^=]*)(?:=(.*))?$/i.exec(text);
-  if (!db) return { value };
-  const ref = db[1];
+  const own = /^yes=([\s\S]*)$/i.exec(text);
+  if (own) return { value: inferScalar(own[1]) };
+  if (!/^db:/i.test(text)) return { value };
+  let ref = text.slice(3);
+  let sample: string | undefined;
+  const marker = ref.indexOf(" ;sample=");
+  if (marker >= 0) {
+    sample = ref.slice(marker + " ;sample=".length);
+    ref = ref.slice(0, marker);
+  } else if (!/\swhere\s/i.test(ref) && ref.includes("=")) {
+    sample = ref.slice(ref.indexOf("=") + 1);
+    ref = ref.slice(0, ref.indexOf("="));
+  }
   // A database tag keeps its own sample value (not the field value).
-  value = db[2] === undefined ? "" : inferScalar(db[2]);
-  const dot = ref.lastIndexOf(".");
-  const table = dot < 0 ? ref : ref.slice(0, dot);
-  const column = dot < 0 ? "" : ref.slice(dot + 1);
-  return { value, db: { table, column } };
+  value = sample === undefined ? "" : inferScalar(sample);
+  return { value, db: parseDbRef(ref) };
 }
 
 /** "a.b[0].c" -> the generic path with [] for list items, as tags use. */
@@ -91,7 +105,7 @@ export function flatSheet(name: string, data: Json | null, fixed: FixedValues = 
         ? []
         : Object.entries(flatten(data)).map(([k, v]) => {
             const id = genericPathId(k);
-            return [...flatRow(k, v), fixedCell(id ? fixed[id] : undefined)];
+            return [...flatRow(k, v), fixedCell(id ? fixed[id] : undefined, v)];
           })),
     ],
   };
@@ -131,7 +145,7 @@ export function buildWorkbook(opts: {
     {
       name: "Mappings",
       rows: [
-        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with", "Constant value", "Translation", "Constant from database"],
+        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with", "Constant value", "Translation", "Constant from database", "Notes"],
         ...mappings.map((m, i): Cell[] => [
           i + 1,
           isConstPath(m[primary]) ? CONSTANT_SOURCE : pathLabel(m[primary]),
@@ -142,7 +156,8 @@ export function buildWorkbook(opts: {
           mappings.filter((o) => pathId(o[secondary]) === pathId(m[secondary])).length > 1 ? (m.join ?? " ") : "",
           m.constant === undefined ? "" : typeof m.constant === "object" && m.constant !== null ? JSON.stringify(m.constant) : m.constant,
           m.translate ? JSON.stringify(m.translate) : "",
-          m.db ? `${m.db.table}.${m.db.column}` : "",
+          m.db ? formatDbRef(m.db) : "",
+          m.note ?? "",
         ]),
       ],
     },
@@ -155,7 +170,7 @@ export function buildWorkbook(opts: {
         ...(["left", "right"] as const).flatMap((side) =>
           Object.entries(headers[side] ?? {}).map(([name, value]): Cell[] => {
             const [, cell, type] = flatRow(name, value);
-            return [side, name, cell, type, fixedCell(opts.fixed?.[side]?.[pathId([HEADERS_SEGMENT, name])])];
+            return [side, name, cell, type, fixedCell(opts.fixed?.[side]?.[pathId([HEADERS_SEGMENT, name])], value)];
           }),
         ),
       ],
@@ -277,7 +292,7 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
   const seenPairs = new Set<string>();
 
   mappingSheet.rows.slice(1).forEach((row, i) => {
-    const [, from, to, , , join, constantCell, translationCell, dbCell] = row;
+    const [, from, to, , , join, constantCell, translationCell, dbCell, noteCell] = row;
     if (from === null && to === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -299,9 +314,7 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
       const sep = join === null || join === undefined || join === "" ? {} : { join: String(join) };
       let db: DbRef | undefined;
       if (isConstant && dbCell !== null && dbCell !== undefined && String(dbCell).trim()) {
-        const ref = String(dbCell).trim();
-        const dot = ref.lastIndexOf(".");
-        db = { table: dot < 0 ? ref : ref.slice(0, dot), column: dot < 0 ? "" : ref.slice(dot + 1) };
+        db = parseDbRef(String(dbCell));
       }
       const constant = isConstant ? { constant: (constantCell ?? "") as Json, ...(db ? { db } : {}) } : {};
       let translate = {};
@@ -314,7 +327,8 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
           warnings.push(`${where}: the Translation column couldn't be read, so it was left out`);
         }
       }
-      const extra = { ...sep, ...constant, ...translate };
+      const note = noteCell !== null && noteCell !== undefined && String(noteCell).trim() ? { note: String(noteCell) } : {};
+      const extra = { ...sep, ...constant, ...translate, ...note };
       mappings.push(primary === "left" ? { left: src, right: dst, ...extra } : { left: dst, right: src, ...extra });
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);

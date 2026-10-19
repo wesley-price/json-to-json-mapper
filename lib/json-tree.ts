@@ -33,6 +33,8 @@ export interface Mapping {
   db?: DbRef;
   /** Value translation table applied on the way through. */
   translate?: Translation;
+  /** Free text for whoever implements the mapping (business rules, open questions). */
+  note?: string;
 }
 
 /** Separator per target (pathId) for mappings whose target is on `targetSide`. */

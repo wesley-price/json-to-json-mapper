@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { ArrayExamples } from "./ArrayExamples";
+import { MoreValuesEditor } from "./MoreValues";
 import { ConstantFields, draftOf, fromDraft } from "./TranslationEditor";
 import { type DbRef, type FixedValues, describeDb } from "@/lib/transforms";
 import { type Drag, type DropIntent, type DropKind, beginDrag, useDropZone, useIsDragSource } from "./drag";
@@ -73,6 +74,20 @@ export interface FieldTreeProps {
   onToggleFixed?: (path: Path) => void;
   /** Change a tagged constant (hardcoded value or database table/column). */
   onSetFixed?: (path: Path, fixed: { value: Json; db?: DbRef }) => void;
+  /** More values a field can carry (pathId -> values), e.g. other messages for the same error. */
+  moreValues?: Record<string, Json[]>;
+  /** Set a field's extra values; only passed where they apply (a source in multi-source mode). */
+  onSetMoreValues?: (path: Path, values: Json[]) => void;
+  /** pathId -> the case each extra value lands in ("!" prefix = not the sample's case). */
+  moreValueCases?: Record<string, string[]>;
+  /** The case the sample uses. */
+  sampleCase?: string;
+  /** pathId -> a warning tag for the row (e.g. "not mapped · left out"). */
+  flagged?: Map<string, string>;
+  /** Rows to tint so they catch the eye (e.g. unmapped fields with no decision). */
+  attention?: Set<string>;
+  /** Tinted rows also pulse (e.g. while the unmapped button is hovered). */
+  pulse?: boolean;
   /** Title for the root row instead of "{ root }" (e.g. "Headers"). */
   rootLabel?: React.ReactNode;
   /** Wording for the add row at the top level (e.g. "Add header"). */
@@ -238,6 +253,7 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
   const [open, setOpen] = useState(true);
   const [renaming, setRenaming] = useState(false);
   const [editingFixed, setEditingFixed] = useState(false);
+  const [editingMore, setEditingMore] = useState(false);
   const drop = useFieldDropZone(props, node);
   const dragging = useIsDragSource(side, node.path);
 
@@ -268,7 +284,9 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
             ? DROP_STYLES[drop.kind]
             : selected
               ? "border-blue-500 bg-blue-50 dark:bg-blue-950/60"
-              : "border-transparent hover:bg-zinc-100 dark:hover:bg-zinc-800/70",
+              : props.attention?.has(id)
+                ? `${props.pulse ? "attention-pulse " : ""}border-dashed border-amber-400 bg-amber-50/70 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-950/30 dark:hover:bg-amber-950/60`
+                : "border-transparent hover:bg-zinc-100 dark:hover:bg-zinc-800/70",
         ].join(" ")}
         style={{
           paddingLeft: 8 + depth * INDENT,
@@ -363,7 +381,47 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
             </button>
           ))}
 
+        {/* More values this field can carry (a source in multi-source mode). */}
+        {props.onSetMoreValues &&
+          node.sample !== undefined &&
+          node.type !== "object" &&
+          node.type !== "array" &&
+          (props.moreValues?.[id]?.length ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditingMore((v) => !v);
+              }}
+              aria-expanded={editingMore}
+              className={`shrink-0 rounded px-1.5 font-sans text-[10px] font-medium ${
+                props.moreValueCases?.[id]?.some((c) => c.startsWith("!"))
+                  ? "bg-amber-100 text-amber-800 hover:bg-amber-200 dark:bg-amber-950 dark:text-amber-300"
+                  : "bg-violet-100 text-violet-800 hover:bg-violet-200 dark:bg-violet-950 dark:text-violet-300"
+              }`}
+              title="More values for this field. Click to edit."
+            >
+              +{props.moreValues[id].length} value{props.moreValues[id].length === 1 ? "" : "s"}
+            </button>
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditingMore(true);
+              }}
+              className="shrink-0 font-sans text-[11px] text-zinc-400 opacity-0 hover:text-violet-600 focus:opacity-100 group-hover:opacity-100"
+              title="Add more values for this field (e.g. other messages for the same error)"
+              aria-label={`Add more values for ${node.key}`}
+            >
+              ＋values
+            </button>
+          ))}
+
         <span className="ml-auto flex items-center gap-1">
+          {props.flagged?.has(id) && (
+            <span className="shrink-0 rounded border border-dashed border-amber-400 px-1.5 font-sans text-[10px] text-amber-700 dark:border-amber-700 dark:text-amber-400">
+              {props.flagged.get(id)}
+            </span>
+          )}
           {drop && <DropLabel text={drop.label} />}
           {highlight && !drop && (
             <span
@@ -403,6 +461,17 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
         </span>
       </div>
 
+      {editingMore && props.onSetMoreValues && node.sample !== undefined && (
+        <MoreValuesEditor
+          sample={node.sample}
+          values={props.moreValues?.[id] ?? []}
+          cases={props.moreValueCases?.[id]}
+          sampleCase={props.sampleCase}
+          onChange={(values) => props.onSetMoreValues!(node.path, values)}
+          onDone={() => setEditingMore(false)}
+          indent={8 + (depth + 1) * INDENT}
+        />
+      )}
       {editingFixed && props.fixed?.[id] !== undefined && (
         <div
           className="my-1 flex flex-wrap items-center gap-2 rounded-md border border-dashed border-amber-300 bg-amber-50/50 py-1.5 pr-2 font-sans text-xs dark:border-amber-900 dark:bg-amber-950/20"
@@ -483,7 +552,8 @@ function TypeSelect({ value, onChange }: { value: FieldType; onChange: (t: Field
       value={value}
       onClick={(e) => e.stopPropagation()}
       onChange={(e) => onChange(e.target.value as FieldType)}
-      className={`rounded px-1 text-[11px] outline-none ${TYPE_STYLES[value]}`}
+      // Looks like the read-only badge; the outline on hover shows it can be changed.
+      className={`cursor-pointer appearance-none rounded px-1.5 text-[11px] outline-none hover:ring-1 hover:ring-current focus:ring-1 focus:ring-blue-500 ${TYPE_STYLES[value]}`}
       title="Change type (resets value)"
     >
       {FIELD_TYPES.map((t) => (

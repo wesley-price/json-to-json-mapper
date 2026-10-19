@@ -34,6 +34,8 @@ import {
   sourceLabel,
 } from "@/lib/transforms";
 import { type Headers, applyWithHeaders, headersText, lookupTree, supportsHeaders, valuesAtPath } from "@/lib/headers";
+import { type FieldDecisions, type FieldQuestions, type Spec, UNMAPPED_OPTIONS, applyRules, normalizeSpec, unmappedFields } from "@/lib/spec";
+import { type TestCase, numberCases, someHeaders } from "./test-cases";
 
 export const STORAGE_KEY = "object-mapper:v1";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
@@ -45,12 +47,18 @@ interface SavedSide {
   layout?: FlatLayout;
   headers?: Headers;
   fixed?: FixedValues;
+  decisions?: FieldDecisions;
+  questions?: FieldQuestions;
 }
 export interface Saved {
   sides: Record<Side, SavedSide>;
   primary: Side;
   mappings: Mapping[];
+  spec?: Partial<Spec>;
 }
+
+/** What an unmapped target field gets, in words. */
+export const unmappedGets = (id: string) => UNMAPPED_OPTIONS.find((o) => o.id === id)?.rule ?? id;
 
 export interface ReportMapping {
   id: string;
@@ -95,10 +103,14 @@ function leafPaths(node: FieldNode, out: Path[] = []): Path[] {
 }
 
 /** Plain-language notes about how a mapping behaves. */
-function notesFor(from: Path, to: Path, fromType?: string, toType?: string, sourceCount = 0): string[] {
+function notesFor(from: Path, to: Path, fromType?: string, toType?: string, sourceCount = 0, convert = false): string[] {
   const notes: string[] = [];
   if (fromType && toType && fromType !== toType) {
-    notes.push(`Type changes from ${fromType} to ${toType}; the value is copied as-is.`);
+    notes.push(
+      convert
+        ? `Type changes from ${fromType} to ${toType}; the value is converted to ${toType}.`
+        : `Type changes from ${fromType} to ${toType}; the value is copied as-is.`,
+    );
   }
   const df = depthOf(from);
   const dt = depthOf(to);
@@ -170,12 +182,19 @@ export function buildReport(saved: Saved | null) {
     mapping: m,
   }));
   const { inputs, constants } = engineInputs(saved.mappings ?? [], primary, secondary, src.fixed, dst.fixed);
-  const mapped = applyWithHeaders(
-    { body: src.data, headers: srcHeaders },
-    { body: dst.data, headers: dstHeaders },
-    inputs,
-    joins,
-    constants,
+  const spec = normalizeSpec(saved.spec);
+  // The hand-off rules (unmapped fields, missing values, types) apply to the sample result too.
+  const mapped = applyRules(
+    applyWithHeaders({ body: src.data, headers: srcHeaders }, { body: dst.data, headers: dstHeaders }, inputs, joins, constants),
+    {
+      targetTree: lookupTree(dst.data, dstHeaders),
+      mappings: inputs,
+      source: { body: src.data, headers: srcHeaders },
+      sourceFixed: src.fixed,
+      targetFixed: dst.fixed,
+      decisions: dst.decisions,
+      spec,
+    },
   );
   const targetTags = dst.fixed ?? {};
   const result = mapped.body;
@@ -210,6 +229,7 @@ export function buildReport(saved: Saved | null) {
             ]
           : []),
         ...(mapping.translate ? [`Values translated: ${describeTranslation(mapping.translate)}.`] : []),
+        ...(mapping.note?.trim() ? [`Note: ${mapping.note.trim()}`] : []),
       ];
       return {
         ...p,
@@ -223,7 +243,7 @@ export function buildReport(saved: Saved | null) {
         sourceValues,
         written,
         // Combined values are always text, so per-part type notes would be noise.
-        notes: combined ? extraNotes : [...extraNotes, ...(isConst ? [] : notesFor(p.from, to, fromType, toType, sourceValues.length))],
+        notes: combined ? extraNotes : [...extraNotes, ...(isConst ? [] : notesFor(p.from, to, fromType, toType, sourceValues.length, spec.coerce === "convert"))],
       };
     });
     if (!combined) {
@@ -307,7 +327,30 @@ export function buildReport(saved: Saved | null) {
     resultText: writeFormat(dstFormat, result, dstLayout),
     /** The target's headers after mapping as "name: value" lines (empty when none). */
     resultHeadersText: resultHeaders && Object.keys(resultHeaders).length ? headersText(resultHeaders) : "",
-    unmapped: targetLeaves.filter((p) => !covered(p)).map(pathLabel),
+    /** Target fields no mapping writes, with what each gets (its decision or the document rule). */
+    unmapped: unmappedFields(
+      lookupTree(dst.data, dstHeaders),
+      (saved.mappings ?? []).map((m) => m[secondary]),
+      dst.fixed,
+      dst.decisions,
+      spec,
+      dst.questions,
+    ).map((f) => ({
+      label: f.label,
+      gets: unmappedGets(f.effective) + (f.question ? ` — question: ${f.question}` : ""),
+      decided: !!f.decision,
+      ask: f.effective === "ask",
+      question: f.question ?? "",
+    })),
+    spec,
+    /** The sample as an input with its expected output. */
+    testCases: numberCases([
+      {
+        title: `${src.name?.trim() || "Source"} sample`,
+        input: { body: src.data, headers: someHeaders(srcHeaders), text: writeFormat(srcFormat, src.data, src.layout ?? defaultFlatLayout()) },
+        expected: { body: result, headers: someHeaders(resultHeaders), text: writeFormat(dstFormat, result, dstLayout) },
+      },
+    ]) as TestCase[],
     targetLeafCount: targetLeaves.length,
     mappedLeafCount: targetLeaves.filter(covered).length,
   };

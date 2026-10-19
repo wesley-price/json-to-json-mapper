@@ -3,8 +3,8 @@
 // error response. Each source has cases; a case has conditions and its own
 // mappings. Cases are checked top to bottom and the first match is used.
 
-import { type Headers, valuesAtPath } from "./headers";
-import type { Json, Mapping, Path } from "./json-tree";
+import { type Headers, HEADERS, valuesAtPath } from "./headers";
+import { type Json, type Mapping, type Path, setValueAt } from "./json-tree";
 
 export type ConditionOp =
   | "equals"
@@ -43,6 +43,8 @@ export interface MappingCase {
   /** All must hold. No conditions = always matches (an "otherwise" case). */
   when: Condition[];
   mappings: Mapping[];
+  /** Free text for whoever implements this case. */
+  note?: string;
 }
 
 export interface SourceDef<S> {
@@ -52,6 +54,42 @@ export interface SourceDef<S> {
   side: S;
   cases: MappingCase[];
   activeCase: string;
+  /** More example messages of the same object (only some values differ from the sample). */
+  examples?: SourceExample[];
+}
+
+/**
+ * Another example of a source: the sample with some values changed, e.g. the
+ * same error object carrying a different message or code.
+ */
+export interface SourceExample {
+  id: string;
+  name: string;
+  /** pathId -> value; header fields use the $headers prefix. Fields not listed keep the sample's value. */
+  values: Record<string, Json>;
+}
+
+/** The sample with an example's values applied. */
+export function applyExample(
+  body: Json,
+  headers: Headers | undefined,
+  values: Record<string, Json>,
+): { body: Json; headers: Headers | undefined } {
+  let b = body;
+  let h = headers;
+  for (const [id, value] of Object.entries(values)) {
+    const path = JSON.parse(id) as Path;
+    if (path[0] === HEADERS) {
+      if (h) h = setValueAt(h, path.slice(1), value) as Headers;
+    } else b = setValueAt(b, path, value);
+  }
+  return { body: b, headers: h };
+}
+
+/** "errorMessage = "Card declined", status = 402" */
+export function describeExample(values: Record<string, Json>, label: (p: Path) => string): string {
+  const parts = Object.entries(values).map(([id, v]) => `${label(JSON.parse(id) as Path)} = ${JSON.stringify(v)}`);
+  return parts.length ? parts.join(", ") : "same values as the sample";
 }
 
 const isEmpty = (v: Json | undefined) => v === undefined || v === null || v === "";

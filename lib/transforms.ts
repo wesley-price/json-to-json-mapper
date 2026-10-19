@@ -18,6 +18,21 @@ export const CONST = "$const";
 export interface DbRef {
   table: string;
   column: string;
+  /** Which row to read, e.g. "code = errorCode" (a source field) or "id = 1". */
+  where?: string;
+}
+
+/** "error_codes.message where code = errorCode" */
+export const formatDbRef = (d: DbRef) =>
+  `${d.table}.${d.column}${d.where?.trim() ? ` where ${d.where.trim()}` : ""}`;
+
+/** Read "table.column" or "table.column where …" back. */
+export function parseDbRef(text: string): DbRef {
+  const m = /^(.*?)(?:\s+where\s+([\s\S]*))?$/i.exec(text.trim());
+  const ref = (m?.[1] ?? "").trim();
+  const dot = ref.lastIndexOf(".");
+  const where = m?.[2]?.trim();
+  return { table: dot < 0 ? ref : ref.slice(0, dot), column: dot < 0 ? "" : ref.slice(dot + 1), ...(where ? { where } : {}) };
 }
 
 /** "{error_codes.code}" — shown in previews when a database constant has no sample value. */
@@ -30,7 +45,8 @@ export function constantValue(value: Json | undefined, db?: DbRef): Json {
 }
 
 /** "database error_codes.code" */
-export const describeDb = (d: DbRef) => `database ${d.table.trim() || "?"}.${d.column.trim() || "?"}`;
+export const describeDb = (d: DbRef) =>
+  `database ${d.table.trim() || "?"}.${d.column.trim() || "?"}${d.where?.trim() ? ` where ${d.where.trim()}` : " (no lookup key yet)"}`;
 
 export const isConstPath = (p: Path) => p[0] === CONST;
 

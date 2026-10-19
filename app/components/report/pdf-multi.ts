@@ -4,12 +4,13 @@
 
 import { formatInfo } from "@/lib/formats";
 import type { MultiReportModel } from "./multi-model";
-import { pdfReadySvg, pdfText, svgHeight } from "./pdf";
+import { type PdfCtx, buildPdf, pdfReadySvg, pdfText, svgHeight } from "./pdf";
+import type { Spec } from "@/lib/spec";
+import type { TestCase } from "./test-cases";
 
-const PAGE_W = 210;
 const PAGE_H = 297;
 const MARGIN = 14;
-const CONTENT_W = PAGE_W - MARGIN * 2;
+const CONTENT_W = 210 - MARGIN * 2;
 const LINE = 3.6; // mm per line of 8pt text
 
 export async function downloadMultiReportPdf(
@@ -17,15 +18,31 @@ export async function downloadMultiReportPdf(
   diagram: (id: string) => SVGSVGElement | null,
   filename: string,
 ): Promise<void> {
-  const [{ jsPDF }, { svg2pdf }] = await Promise.all([import("jspdf"), import("svg2pdf.js")]);
-  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
   const title = model.docName || "Mapping report";
-  doc.setProperties({ title: pdfText(title), subject: "Multi-source mapping report" });
+  await buildPdf({ title, subject: "Multi-source mapping report", footer: title, filename }, (ctx) =>
+    renderMultiReportPdf(ctx, model, diagram, {
+      title,
+      kicker: "MULTI-SOURCE MAPPING REPORT",
+      rules: { spec: model.spec, docName: model.docName, questions: model.openQuestions },
+      testCases: model.testCases,
+    }),
+  );
+}
 
-  // svg2pdf reads the SVG from the document, so converted copies are briefly attached off-screen.
-  const host = document.createElement("div");
-  host.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;visibility:hidden";
-  document.body.appendChild(host);
+/** Draw the multi-source report into `ctx.doc`, starting at the top of its current (empty) page. */
+export async function renderMultiReportPdf(
+  { doc, svg2pdf, host }: PdfCtx,
+  model: MultiReportModel,
+  diagram: (id: string) => SVGSVGElement | null,
+  opts: {
+    title: string;
+    kicker: string;
+    rules?: { spec: Spec; docName: string; questions?: { field: string; question: string }[] };
+    testCases?: TestCase[];
+  },
+): Promise<void> {
+  const { title, kicker } = opts;
+  const { drawRulesPage, drawTestCases } = await import("./pdf-sections");
 
   let y = MARGIN;
   const newPage = () => {
@@ -108,10 +125,10 @@ export async function downloadMultiReportPdf(
     y += h + 3;
   };
 
-  try {
+  {
     // ---------- Title, summary, coverage ----------
     font("helvetica", "bold", 8, "#71717a");
-    doc.text("MULTI-SOURCE MAPPING REPORT", MARGIN, y + 1);
+    doc.text(pdfText(kicker), MARGIN, y + 1);
     y += 4;
     font("helvetica", "bold", 20);
     doc.text(lines(title, CONTENT_W)[0], MARGIN, y + 6);
@@ -119,10 +136,16 @@ export async function downloadMultiReportPdf(
 
     const summary: [string, string][] = [
       ["Generated", model.generated.toLocaleString()],
+      ...(model.spec.version.trim() ? [["Version", model.spec.version.trim()] as [string, string]] : []),
+      ...(model.spec.author.trim() ? [["Author", model.spec.author.trim()] as [string, string]] : []),
+      ...(model.spec.purpose.trim() ? [["Purpose", model.spec.purpose.trim()] as [string, string]] : []),
       ["Standard", `${model.standard.name !== "Standard" ? `${model.standard.name} - ` : ""}${formatInfo(model.standard.format).label} - ${model.standard.fieldCount} fields`],
       ["Sources", model.sources.map((s) => s.name).join(", ")],
       ["Cases / mappings", `${model.caseCount} cases - ${model.mappingCount} mappings`],
       ["Coverage gaps", String(model.gapCount)],
+      ...(model.standardConstants.length
+        ? [["Constants", model.standardConstants.map((c) => `${c.label} = ${c.text}`).join(", ")] as [string, string]]
+        : []),
     ];
     for (const [k, v] of summary) {
       font("helvetica", "normal", 9.5, "#71717a");
@@ -149,6 +172,8 @@ export async function downloadMultiReportPdf(
         shade: [false, ...r.cells.map((c) => c.gap)],
       })),
     );
+
+    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions);
 
     // ---------- One section per source ----------
     for (const src of model.sources) {
@@ -182,6 +207,12 @@ export async function downloadMultiReportPdf(
         const cond = lines(`when ${c.conditions}`, CONTENT_W);
         doc.text(cond, MARGIN, y);
         y += cond.length * LINE + 2;
+        if (c.note) {
+          font("helvetica", "italic", 8.5, "#075985");
+          const note = lines(`Note: ${c.note}`, CONTENT_W);
+          doc.text(note, MARGIN, y);
+          y += note.length * LINE + 2;
+        }
         await drawDiagram(c.id, 130);
         table(
           [
@@ -219,18 +250,64 @@ export async function downloadMultiReportPdf(
           }
         }
       }
-    }
 
-    // Page numbers.
-    const pages = doc.getNumberOfPages();
-    for (let i = 1; i <= pages; i++) {
-      doc.setPage(i);
-      font("helvetica", "normal", 7.5, "#a1a1aa");
-      doc.text(`${pdfText(title)} - page ${i} of ${pages}`, PAGE_W / 2, PAGE_H - 7, { align: "center" });
-    }
+      // More values the source's fields can carry.
+      if (src.moreValues.length) {
+        ensure(16);
+        y += 5;
+        font("helvetica", "bold", 10.5);
+        doc.text("More values", MARGIN, y);
+        y += 4.5;
+        table(
+          [
+            { label: "Field", width: 50, mono: true },
+            { label: "Value", width: CONTENT_W - 100, mono: true },
+            { label: "Case used", width: 50 },
+          ],
+          src.moreValues.map((m) => ({
+            cells: [m.field, m.value, m.sameCase ? m.caseName : `${m.caseName} (not the sample's case)`],
+            shade: [false, false, !m.sameCase],
+          })),
+        );
+      }
 
-    doc.save(filename);
-  } finally {
-    host.remove();
+      // More messages of the same object.
+      if (src.examples.length) {
+        ensure(16);
+        y += 5;
+        font("helvetica", "bold", 10.5);
+        doc.text("Other examples", MARGIN, y);
+        y += 4.5;
+        table(
+          [
+            { label: "Example", width: 40 },
+            { label: "Values that differ from the sample", width: CONTENT_W - 84, mono: true },
+            { label: "Case used", width: 44 },
+          ],
+          src.examples.map((ex) => ({
+            cells: [ex.name, ex.changes, "error" in ex.test ? ex.test.error : ex.test.caseName],
+            shade: [false, false, "error" in ex.test],
+          })),
+        );
+        for (const ex of src.examples) {
+          if ("error" in ex.test) continue;
+          ensure(12);
+          y += 3;
+          font("helvetica", "bold", 8.5);
+          doc.text(pdfText(`${ex.name} - case "${ex.test.caseName}"`), MARGIN, y + 2);
+          y += 5;
+          font("courier", "normal", 7, "#27272a");
+          for (const raw of ex.test.text.replace(/\n$/, "").split("\n")) {
+            for (const line of lines(raw || " ", CONTENT_W)) {
+              ensure(3.2);
+              doc.text(line, MARGIN, y);
+              y += 3.1;
+            }
+          }
+          y += 2;
+        }
+      }
+    }
+    if (opts.testCases) drawTestCases(doc, opts.testCases);
   }
 }

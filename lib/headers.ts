@@ -15,6 +15,8 @@ import {
 } from "./json-tree";
 
 export const HEADERS = "$headers";
+// Constant mappings read from this root (see lib/transforms.ts); it is never wrapped.
+const CONSTS = "$const";
 const BODY = "$body";
 
 export type Headers = { [name: string]: Json };
@@ -44,7 +46,7 @@ export function valuesAtPath(body: Json, headers: Headers | undefined, path: Pat
 }
 
 /** Header and body paths side by side under one root. */
-const wrap = (p: Path): Path => (isHeaderPath(p) ? p : [BODY, ...p]);
+const wrap = (p: Path): Path => (isHeaderPath(p) || p[0] === CONSTS ? p : [BODY, ...p]);
 
 /**
  * applyMappings over headers and body together: sources and targets may be
@@ -53,15 +55,17 @@ const wrap = (p: Path): Path => (isHeaderPath(p) ? p : [BODY, ...p]);
 export function applyWithHeaders(
   source: { body: Json; headers?: Headers },
   target: { body: Json; headers?: Headers },
-  mappings: { from: Path; to: Path }[],
+  mappings: { from: Path; to: Path; transform?: (v: Json) => Json }[],
   joins: Map<string, string> = new Map(),
+  /** Values for constant mappings, by key. */
+  constants: Record<string, Json> = {},
 ): { body: Json; headers: Headers } {
   const wrappedJoins = new Map<string, string>();
   for (const [id, sep] of joins) wrappedJoins.set(pathId(wrap(JSON.parse(id) as Path)), sep);
   const result = applyMappings(
-    { [HEADERS]: source.headers ?? {}, [BODY]: source.body },
+    { [HEADERS]: source.headers ?? {}, [BODY]: source.body, [CONSTS]: constants },
     { [HEADERS]: target.headers ?? {}, [BODY]: target.body },
-    mappings.map((m) => ({ from: wrap(m.from), to: wrap(m.to) })),
+    mappings.map((m) => ({ from: wrap(m.from), to: wrap(m.to), transform: m.transform })),
     wrappedJoins,
   ) as { [key: string]: Json };
   return { body: result[BODY], headers: (result[HEADERS] ?? {}) as Headers };

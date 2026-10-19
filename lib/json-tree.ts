@@ -2,6 +2,8 @@
 // A path is a list of segments: object keys, or ARRAY_ITEM ("[]") meaning
 // "every element of this array".
 
+import type { DbRef, Translation } from "./transforms";
+
 export type Json =
   | string
   | number
@@ -25,6 +27,12 @@ export interface Mapping {
    * text (a space by default). Every mapping in the group carries the same value.
    */
   join?: string;
+  /** A fixed value written instead of a source field (the source path is [CONST, key]). */
+  constant?: Json;
+  /** Set when the constant comes from a database table/column (constant is then a sample value). */
+  db?: DbRef;
+  /** Value translation table applied on the way through. */
+  translate?: Translation;
 }
 
 /** Separator per target (pathId) for mappings whose target is on `targetSide`. */
@@ -290,7 +298,7 @@ const indexPrefix = (a: number[], b: number[]) => a.length <= b.length && a.ever
 export function applyMappings(
   source: Json,
   template: Json,
-  mappings: { from: Path; to: Path }[],
+  mappings: { from: Path; to: Path; transform?: (v: Json) => Json }[],
   joins: Map<string, string> = new Map(),
 ): Json {
   const templates: Templates = new Map();
@@ -319,11 +327,13 @@ export function applyMappings(
   const depth = (p: Path) => p.filter((seg) => seg === ARRAY_ITEM).length;
 
   // Group mappings by target, keeping their order (it is the join order).
-  const groups = new Map<string, { to: Path; froms: Path[] }>();
-  for (const { from, to } of mappings) {
+  const groups = new Map<string, { to: Path; froms: Path[]; transforms: ((v: Json) => Json)[] }>();
+  const same = (v: Json) => v;
+  for (const { from, to, transform } of mappings) {
     const id = pathId(to);
-    if (!groups.has(id)) groups.set(id, { to, froms: [] });
+    if (!groups.has(id)) groups.set(id, { to, froms: [], transforms: [] });
     groups.get(id)!.froms.push(from);
+    groups.get(id)!.transforms.push(transform ?? same);
   }
   // The source with the most list levels decides how many values are written.
   const units = [...groups.entries()].map(([id, g]) => {
@@ -337,7 +347,8 @@ export function applyMappings(
   units.sort((a, b) => copiesIntoList(a) - copiesIntoList(b));
 
   for (const u of units) {
-    const sets = u.froms.map((f) => collect(source, f));
+    // Each part's values, already passed through its transform (e.g. a translation table).
+    const sets = u.froms.map((f, k) => collect(source, f).map((m) => ({ ...m, value: u.transforms[k](m.value) })));
     if (u.froms.length === 1) {
       for (const { indexes, value } of sets[0]) result = assign(result, u.to, indexes, value, templates);
       continue;

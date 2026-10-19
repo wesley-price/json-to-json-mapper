@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import { ArrayExamples } from "./ArrayExamples";
+import { ConstantFields, draftOf, fromDraft } from "./TranslationEditor";
+import { type DbRef, type FixedValues, describeDb } from "@/lib/transforms";
 import { type Drag, type DropIntent, type DropKind, beginDrag, useDropZone, useIsDragSource } from "./drag";
 import {
   ARRAY_ITEM,
@@ -65,6 +67,12 @@ export interface FieldTreeProps {
   onSetArrayItems: (arrayPath: Path, items: Json[]) => void;
   /** Change a field's example value. */
   onSetValue: (path: Path, value: Json) => void;
+  /** Fields tagged as constants (pathId -> value); only passed for the non-primary side. */
+  fixed?: FixedValues;
+  /** Tag / untag a field value as a constant. */
+  onToggleFixed?: (path: Path) => void;
+  /** Change a tagged constant (hardcoded value or database table/column). */
+  onSetFixed?: (path: Path, fixed: { value: Json; db?: DbRef }) => void;
   /** Title for the root row instead of "{ root }" (e.g. "Headers"). */
   rootLabel?: React.ReactNode;
   /** Wording for the add row at the top level (e.g. "Add header"). */
@@ -229,6 +237,7 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
   const { node, depth, side, editable, selectedId, mappedColors } = props;
   const [open, setOpen] = useState(true);
   const [renaming, setRenaming] = useState(false);
+  const [editingFixed, setEditingFixed] = useState(false);
   const drop = useFieldDropZone(props, node);
   const dragging = useIsDragSource(side, node.path);
 
@@ -326,6 +335,34 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
             <span className="truncate text-xs text-zinc-400">{JSON.stringify(node.sample)}</span>
           ))}
 
+        {props.onToggleFixed &&
+          node.sample !== undefined &&
+          (props.fixed?.[id] !== undefined ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditingFixed((v) => !v);
+              }}
+              aria-expanded={editingFixed}
+              className="shrink-0 truncate rounded bg-amber-100 px-1.5 font-sans text-[10px] font-medium text-amber-800 hover:bg-amber-200 dark:bg-amber-950 dark:text-amber-300"
+              title="Tagged as a constant. Click to edit or untag."
+            >
+              📌 {props.fixed[id].db ? describeDb(props.fixed[id].db!) : "constant"}
+            </button>
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onToggleFixed!(node.path);
+              }}
+              className="shrink-0 font-sans text-[11px] text-zinc-400 opacity-0 hover:text-amber-600 focus:opacity-100 group-hover:opacity-100"
+              title="Tag this value as a constant"
+              aria-label={`Tag ${node.key} as a constant`}
+            >
+              📌
+            </button>
+          ))}
+
         <span className="ml-auto flex items-center gap-1">
           {drop && <DropLabel text={drop.label} />}
           {highlight && !drop && (
@@ -366,6 +403,30 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
         </span>
       </div>
 
+      {editingFixed && props.fixed?.[id] !== undefined && (
+        <div
+          className="my-1 flex flex-wrap items-center gap-2 rounded-md border border-dashed border-amber-300 bg-amber-50/50 py-1.5 pr-2 font-sans text-xs dark:border-amber-900 dark:bg-amber-950/20"
+          style={{ paddingLeft: 8 + (depth + 1) * INDENT }}
+        >
+          <span className="text-zinc-600 dark:text-zinc-400">Constant</span>
+          <ConstantFields
+            draft={draftOf(props.fixed[id].value, props.fixed[id].db)}
+            onChange={(d) => props.onSetFixed?.(node.path, fromDraft(d))}
+          />
+          <button
+            onClick={() => {
+              setEditingFixed(false);
+              props.onToggleFixed?.(node.path);
+            }}
+            className="text-zinc-500 hover:text-red-600"
+          >
+            Untag
+          </button>
+          <button onClick={() => setEditingFixed(false)} className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100">
+            Done
+          </button>
+        </div>
+      )}
       {open && node.type === "array" && (
         <ArrayExamples
           node={node}

@@ -4,7 +4,9 @@
 // Sheets (matched by name prefix on import, falling back to position):
 //   1. "Mapped Result"   Field | Value | Type   (export only; ignored on import)
 //   2. "Mappings"        # | Source (<side>) | Target (<side>) | Source type | Target type | Join with
-//                        (rows sharing a target are combined, in row order, joined with "Join with")
+//                        | Constant value | Translation (JSON)
+//                        (rows sharing a target are combined, in row order, joined with "Join with";
+//                         a Source of "(constant)" writes the Constant value instead of a field)
 //   3. "Primary (<side>)" Field | Value | Type  (flattened primary object)
 //   4. "Target (<side>)"  Field | Value | Type  (flattened editable object)
 //   5. "Formats"         Side | Format | Flat layout (JSON)   (optional; older workbooks are JSON)
@@ -26,25 +28,71 @@ import {
 } from "./json-tree";
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
 import { type Headers, lookupTree, supportsHeaders } from "./headers";
+import { type DbRef, type Fixed, type FixedValues, type Translation, isConstPath, newConstPath } from "./transforms";
+import { inferScalar } from "./formats/xml";
 import type { Cell, Sheet } from "./xlsx";
+
+const CONSTANT_SOURCE = "(constant)";
+const HEADERS_SEGMENT = "$headers";
 
 export type SideFormats = Record<Side, { format: Format; layout: FlatLayout }>;
 
 const other = (side: Side): Side => (side === "left" ? "right" : "left");
 
 /** One spreadsheet row for a flattened field; empty containers show as {} / []. */
-function flatRow(field: string, value: Json): Cell[] {
+export function flatRow(field: string, value: Json): Cell[] {
   const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
   const cell: Cell = typeof value === "object" && value !== null ? JSON.stringify(value) : value;
   return [field, cell, type];
 }
 
-function flatSheet(name: string, data: Json | null): Sheet {
+/**
+ * "yes" for a hardcoded tag (its value is the field value), or
+ * "db:table.column" plus "=sample" when a database tag has a sample value.
+ */
+export function fixedCell(fixed: Fixed | undefined): Cell {
+  if (!fixed) return "";
+  if (!fixed.db) return "yes";
+  const sample = fixed.value === null || fixed.value === undefined || fixed.value === "" ? "" : `=${typeof fixed.value === "object" ? JSON.stringify(fixed.value) : fixed.value}`;
+  return `db:${fixed.db.table}.${fixed.db.column}${sample}`;
+}
+
+/** Read a Constant cell back ("yes" / "db:table.column"); undefined when not tagged. */
+export function readFixedCell(cell: Cell, fieldValue: Json): Fixed | undefined {
+  let value = fieldValue;
+  const text = String(cell ?? "").trim();
+  if (!text || /^(no|false|0)$/i.test(text)) return undefined;
+  const db = /^db:([^=]*)(?:=(.*))?$/i.exec(text);
+  if (!db) return { value };
+  const ref = db[1];
+  // A database tag keeps its own sample value (not the field value).
+  value = db[2] === undefined ? "" : inferScalar(db[2]);
+  const dot = ref.lastIndexOf(".");
+  const table = dot < 0 ? ref : ref.slice(0, dot);
+  const column = dot < 0 ? "" : ref.slice(dot + 1);
+  return { value, db: { table, column } };
+}
+
+/** "a.b[0].c" -> the generic path with [] for list items, as tags use. */
+export function genericPathId(label: string): string | null {
+  try {
+    return pathId(parsePathLabel(label).map((seg) => (typeof seg === "number" ? "[]" : seg)));
+  } catch {
+    return null;
+  }
+}
+
+export function flatSheet(name: string, data: Json | null, fixed: FixedValues = {}): Sheet {
   return {
     name,
     rows: [
-      ["Field", "Value", "Type"],
-      ...(data === null ? [] : Object.entries(flatten(data)).map(([k, v]) => flatRow(k, v))),
+      ["Field", "Value", "Type", "Constant"],
+      ...(data === null
+        ? []
+        : Object.entries(flatten(data)).map(([k, v]) => {
+            const id = genericPathId(k);
+            return [...flatRow(k, v), fixedCell(id ? fixed[id] : undefined)];
+          })),
     ],
   };
 }
@@ -56,6 +104,12 @@ export function buildWorkbook(opts: {
   result: Json | null;
   formats: SideFormats;
   headers?: Record<Side, Headers>;
+  /** Fields tagged as constants on each side. */
+  fixed?: Record<Side, FixedValues>;
+  /** The document name (stored on the Document sheet). */
+  docName?: string;
+  /** What each object is called. */
+  names?: Record<Side, string>;
 }): Sheet[] {
   const { primary, data, mappings, result, formats } = opts;
   const headers = opts.headers ?? { left: {}, right: {} };
@@ -69,32 +123,39 @@ export function buildWorkbook(opts: {
     return (tree && findNode(tree, path)?.type) ?? "";
   };
   return [
+    documentSheet(opts.docName ?? "", "single", [
+      ["Primary name", opts.names?.[primary] ?? ""],
+      ["Target name", opts.names?.[secondary] ?? ""],
+    ]),
     flatSheet("Mapped Result", result),
     {
       name: "Mappings",
       rows: [
-        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with"],
+        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with", "Constant value", "Translation", "Constant from database"],
         ...mappings.map((m, i): Cell[] => [
           i + 1,
-          pathLabel(m[primary]),
+          isConstPath(m[primary]) ? CONSTANT_SOURCE : pathLabel(m[primary]),
           pathLabel(m[secondary]),
-          typeAt(primary, m[primary]),
+          isConstPath(m[primary]) ? "" : typeAt(primary, m[primary]),
           typeAt(secondary, m[secondary]),
           // Only meaningful when several rows share this target.
           mappings.filter((o) => pathId(o[secondary]) === pathId(m[secondary])).length > 1 ? (m.join ?? " ") : "",
+          m.constant === undefined ? "" : typeof m.constant === "object" && m.constant !== null ? JSON.stringify(m.constant) : m.constant,
+          m.translate ? JSON.stringify(m.translate) : "",
+          m.db ? `${m.db.table}.${m.db.column}` : "",
         ]),
       ],
     },
-    flatSheet(`Primary (${primary})`, data[primary]),
-    flatSheet(`Target (${secondary})`, data[secondary]),
+    flatSheet(`Primary (${primary})`, data[primary], opts.fixed?.[primary]),
+    flatSheet(`Target (${secondary})`, data[secondary], opts.fixed?.[secondary]),
     {
       name: "Headers",
       rows: [
-        ["Side", "Header", "Value", "Type"],
+        ["Side", "Header", "Value", "Type", "Constant"],
         ...(["left", "right"] as const).flatMap((side) =>
           Object.entries(headers[side] ?? {}).map(([name, value]): Cell[] => {
             const [, cell, type] = flatRow(name, value);
-            return [side, name, cell, type];
+            return [side, name, cell, type, fixedCell(opts.fixed?.[side]?.[pathId([HEADERS_SEGMENT, name])])];
           }),
         ),
       ],
@@ -121,6 +182,9 @@ export interface ImportedWorkbook {
   mappings: Omit<Mapping, "id">[];
   formats: SideFormats;
   headers: Record<Side, Headers>;
+  fixed: Record<Side, FixedValues>;
+  docName: string;
+  names: Record<Side, string>;
   /** Human-readable notes about anything that was skipped. */
   warnings: string[];
 }
@@ -131,7 +195,7 @@ const sideIn = (text: Cell): Side | null => {
 };
 
 /** Turn a cell back into a JSON value, using the Type column when present. */
-function toJson(value: Cell, type: Cell): Json {
+export function toJson(value: Cell, type: Cell): Json {
   const t = String(type ?? "").trim().toLowerCase();
   switch (t) {
     case "null":
@@ -158,13 +222,18 @@ function toJson(value: Cell, type: Cell): Json {
   }
 }
 
-function readFlatSheet(sheet: Sheet, label: string, warnings: string[]): Json {
+export function readFlatSheet(sheet: Sheet, label: string, warnings: string[], fixed: FixedValues = {}): Json {
   const entries: [(string | number)[], Json][] = [];
   sheet.rows.slice(1).forEach((row, i) => {
     const field = row[0];
     if (field === null || String(field).trim() === "") return;
     try {
-      entries.push([parsePathLabel(String(field)), toJson(row[1] ?? null, row[2] ?? null)]);
+      const value = toJson(row[1] ?? null, row[2] ?? null);
+      entries.push([parsePathLabel(String(field)), value]);
+      // The first list item's row carries the tag for the whole list path.
+      const tag = readFixedCell(row[3] ?? null, value);
+      const id = genericPathId(String(field));
+      if (tag && id && !(id in fixed)) fixed[id] = tag;
     } catch (e) {
       warnings.push(`${label} row ${i + 2}: ${(e as Error).message}`);
     }
@@ -191,14 +260,16 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
   const secondary = other(primary);
   const warnings: string[] = [];
 
+  const fixed: Record<Side, FixedValues> = { left: {}, right: {} };
   const data = {
-    [primary]: readFlatSheet(primarySheet, primarySheet.name, warnings),
-    [secondary]: readFlatSheet(targetSheet, targetSheet.name, warnings),
+    [primary]: readFlatSheet(primarySheet, primarySheet.name, warnings, fixed[primary]),
+    [secondary]: readFlatSheet(targetSheet, targetSheet.name, warnings, fixed[secondary]),
   } as Record<Side, Json>;
 
   // Header fields are valid mapping ends too (on sides whose format has headers).
   const formats = readFormats(sheets, warnings);
-  const headers = readHeaders(sheets, warnings);
+  const headerTags: Record<Side, FixedValues> = { left: {}, right: {} };
+  const headers = readHeaders(sheets, warnings, headerTags);
   const fieldsOf = (side: Side) =>
     allPaths(lookupTree(data[side], supportsHeaders(formats[side].format) ? headers[side] : undefined) ?? buildTree(data[side]));
   const valid = { left: fieldsOf("left"), right: fieldsOf("right") };
@@ -206,7 +277,7 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
   const seenPairs = new Set<string>();
 
   mappingSheet.rows.slice(1).forEach((row, i) => {
-    const [, from, to, , , join] = row;
+    const [, from, to, , , join, constantCell, translationCell, dbCell] = row;
     if (from === null && to === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -215,17 +286,36 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
           if (typeof seg === "number") throw new Error(`use [] instead of [${seg}] in mapping paths`);
           return seg;
         });
-      const src = toPath(from);
+      const isConstant = String(from ?? "").trim() === CONSTANT_SOURCE;
+      const src = isConstant ? newConstPath() : toPath(from);
       const dst = toPath(to);
       if (!src.length || !dst.length) throw new Error("source and target are both required");
-      if (!valid[primary].has(pathId(src))) throw new Error(`"${pathLabel(src)}" isn't a field in ${primarySheet.name}`);
+      if (!isConstant && !valid[primary].has(pathId(src))) throw new Error(`"${pathLabel(src)}" isn't a field in ${primarySheet.name}`);
       if (!valid[secondary].has(pathId(dst))) throw new Error(`"${pathLabel(dst)}" isn't a field in ${targetSheet.name}`);
       const pair = pathId(src) + pathId(dst);
       if (seenPairs.has(pair)) throw new Error(`"${pathLabel(src)}" -> "${pathLabel(dst)}" is listed twice; kept the first`);
       seenPairs.add(pair);
       // Several rows with the same target are combined; "Join with" sets the separator.
       const sep = join === null || join === undefined || join === "" ? {} : { join: String(join) };
-      mappings.push(primary === "left" ? { left: src, right: dst, ...sep } : { left: dst, right: src, ...sep });
+      let db: DbRef | undefined;
+      if (isConstant && dbCell !== null && dbCell !== undefined && String(dbCell).trim()) {
+        const ref = String(dbCell).trim();
+        const dot = ref.lastIndexOf(".");
+        db = { table: dot < 0 ? ref : ref.slice(0, dot), column: dot < 0 ? "" : ref.slice(dot + 1) };
+      }
+      const constant = isConstant ? { constant: (constantCell ?? "") as Json, ...(db ? { db } : {}) } : {};
+      let translate = {};
+      if (translationCell !== null && translationCell !== undefined && String(translationCell).trim()) {
+        try {
+          const t = JSON.parse(String(translationCell)) as Translation;
+          if (!Array.isArray(t.pairs)) throw new Error("no pairs");
+          translate = { translate: t };
+        } catch {
+          warnings.push(`${where}: the Translation column couldn't be read, so it was left out`);
+        }
+      }
+      const extra = { ...sep, ...constant, ...translate };
+      mappings.push(primary === "left" ? { left: src, right: dst, ...extra } : { left: dst, right: src, ...extra });
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);
     }
@@ -238,11 +328,19 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
     if (group.length > 1 && join !== undefined) group.forEach((o) => (o.join = join));
     else if (group.length === 1) delete m.join;
   }
-  return { primary, data, mappings, formats, headers, warnings };
+  // Header tags live on the Headers sheet.
+  for (const side of ["left", "right"] as const) Object.assign(fixed[side], headerTags[side]);
+  const document = readDocument(sheets);
+  const names = { [primary]: document.get("primary name"), [secondary]: document.get("target name") } as Record<Side, string>;
+  return { primary, data, mappings, formats, headers, fixed, docName: document.name, names, warnings };
 }
 
 /** Header name/value pairs per side; a workbook without a Headers sheet has none. */
-function readHeaders(sheets: Sheet[], warnings: string[]): Record<Side, Headers> {
+function readHeaders(
+  sheets: Sheet[],
+  warnings: string[],
+  tags: Record<Side, FixedValues> = { left: {}, right: {} },
+): Record<Side, Headers> {
   const headers: Record<Side, Headers> = { left: {}, right: {} };
   const sheet = sheets.find((s) => s.name.toLowerCase().startsWith("headers"));
   if (!sheet) return headers;
@@ -255,6 +353,8 @@ function readHeaders(sheets: Sheet[], warnings: string[]): Record<Side, Headers>
       return;
     }
     headers[side][name] = toJson(row[2] ?? null, row[3] ?? null);
+    const tag = readFixedCell(row[4] ?? null, headers[side][name]);
+    if (tag) tags[side][pathId([HEADERS_SEGMENT, name])] = tag;
   });
   return headers;
 }
@@ -286,4 +386,29 @@ function readFormats(sheets: Sheet[], warnings: string[]): SideFormats {
     formats[side] = { format: format as Format, layout };
   }
   return formats;
+}
+
+// ---------- Document sheet (both modes) ----------
+
+export type WorkbookMode = "single" | "multi";
+
+/** Name | value rows: the document name and which kind of workbook this is. */
+export function documentSheet(name: string, mode: WorkbookMode, extra: Cell[][] = []): Sheet {
+  return {
+    name: "Document",
+    rows: [
+      ["Property", "Value"],
+      ["Name", name],
+      ["Mode", mode === "multi" ? "multi-source" : "single pair"],
+      ...extra,
+    ],
+  };
+}
+
+export function readDocument(sheets: Sheet[]): { name: string; mode: WorkbookMode; get: (key: string) => string } {
+  const sheet = sheets.find((x) => x.name.toLowerCase() === "document");
+  const get = (key: string) => String(sheet?.rows.find((r) => String(r[0] ?? "").toLowerCase() === key)?.[1] ?? "").trim();
+  const mode: WorkbookMode =
+    /multi/i.test(get("mode")) || sheets.some((x) => x.name.toLowerCase() === "sources") ? "multi" : "single";
+  return { name: get("name"), mode, get };
 }

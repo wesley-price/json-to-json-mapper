@@ -23,11 +23,14 @@ export function pdfText(s: string): string {
     .replace(/…/g, "...")
     .replace(/[—–]/g, "-")
     .replace(/·/g, "-")
+    .replace(/≥/g, ">=")
+    .replace(/≤/g, "<=")
+    .replace(/≠/g, "!=")
     .replace(/[^\x00-\xff]/g, "?");
 }
 
 /** A copy of a diagram SVG with PDF-safe fonts and text. */
-function pdfReadySvg(svg: SVGSVGElement): SVGSVGElement {
+export function pdfReadySvg(svg: SVGSVGElement): SVGSVGElement {
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.querySelectorAll("text").forEach((t) => {
     const family = t.getAttribute("font-family") ?? "";
@@ -39,7 +42,7 @@ function pdfReadySvg(svg: SVGSVGElement): SVGSVGElement {
 }
 
 /** Height (mm) a diagram takes when drawn `width` mm wide. */
-function svgHeight(svg: SVGSVGElement, width: number): number {
+export function svgHeight(svg: SVGSVGElement, width: number): number {
   const vb = svg.viewBox.baseVal;
   return vb && vb.width ? (width * vb.height) / vb.width : 0;
 }
@@ -49,10 +52,13 @@ export async function downloadReportPdf(
   /** The rendered diagram for "overview" or a mapping id. */
   diagram: (id: string) => SVGSVGElement | null,
   filename: string,
+  /** The document name: the title of the report (and its running footer). */
+  docName = "",
 ): Promise<void> {
+  const title = docName.trim() || "Mapping report";
   const [{ jsPDF }, { svg2pdf }] = await Promise.all([import("jspdf"), import("svg2pdf.js")]);
   const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
-  doc.setProperties({ title: "Mapping report", subject: `${model.sourceTitle} to ${model.targetTitle}` });
+  doc.setProperties({ title: pdfText(title), subject: `${model.sourceTitle} to ${model.targetTitle}` });
 
   // svg2pdf reads the SVG from the document, so converted copies are briefly attached off-screen.
   const host = document.createElement("div");
@@ -100,8 +106,13 @@ export async function downloadReportPdf(
 
   try {
     // ---------- Page 1: summary + overview ----------
+    if (docName.trim()) {
+      font("helvetica", "bold", 8, "#71717a");
+      doc.text("MAPPING REPORT", MARGIN, y + 1);
+      y += 4;
+    }
     font("helvetica", "bold", 20);
-    doc.text("Mapping report", MARGIN, y + 6);
+    doc.text(fit(title, CONTENT_W), MARGIN, y + 6);
     y += 14;
 
     const mappingSummary =
@@ -109,8 +120,8 @@ export async function downloadReportPdf(
       (model.combined.length ? `, ${model.combined.length} combined field${model.combined.length === 1 ? "" : "s"}` : "");
     const summary: [string, string][] = [
       ["Generated", model.generated.toLocaleString()],
-      ["Source", `${formatInfo(model.src.format).label} (${model.primary} side)`],
-      ["Target", `${formatInfo(model.dst.format).label} (${model.secondary} side)`],
+      ["Source", `${model.sourceName !== "Source" ? `${model.sourceName} - ` : ""}${formatInfo(model.src.format).label} (${model.primary} side)`],
+      ["Target", `${model.targetName !== "Target" ? `${model.targetName} - ` : ""}${formatInfo(model.dst.format).label} (${model.secondary} side)`],
       ["Mappings", mappingSummary],
       ["Target fields mapped", `${model.mappedLeafCount} of ${model.targetLeafCount}`],
     ];
@@ -378,7 +389,7 @@ export async function downloadReportPdf(
     for (let i = 1; i <= pages; i++) {
       doc.setPage(i);
       font("helvetica", "normal", 7.5, "#a1a1aa");
-      doc.text(`Mapping report - page ${i} of ${pages}`, PAGE_W / 2, PAGE_H - 7, { align: "center" });
+      doc.text(`${pdfText(title)} - page ${i} of ${pages}`, PAGE_W / 2, PAGE_H - 7, { align: "center" });
     }
 
     doc.save(filename);

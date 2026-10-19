@@ -13,6 +13,7 @@ import {
   type Side,
   buildTree,
   findNode,
+  typeOf,
   isPrefix,
   DEFAULT_JOIN,
   joinsFor,
@@ -20,16 +21,30 @@ import {
   pathLabel,
 } from "@/lib/json-tree";
 import type { DiagramLink } from "./MappingDiagram";
+import {
+  CONST,
+  type DbRef,
+  type FixedValues,
+  type Translation,
+  constantValue,
+  describeDb,
+  describeTranslation,
+  engineInputs,
+  isConstPath,
+  sourceLabel,
+} from "@/lib/transforms";
 import { type Headers, applyWithHeaders, headersText, lookupTree, supportsHeaders, valuesAtPath } from "@/lib/headers";
 
 export const STORAGE_KEY = "object-mapper:v1";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
 
 interface SavedSide {
+  name?: string;
   data: Json | null;
   format?: Format;
   layout?: FlatLayout;
   headers?: Headers;
+  fixed?: FixedValues;
 }
 export interface Saved {
   sides: Record<Side, SavedSide>;
@@ -39,6 +54,11 @@ export interface Saved {
 
 export interface ReportMapping {
   id: string;
+  /** Set for a constant mapping (a fixed value instead of a source field). */
+  constant?: Json;
+  /** Set when that constant comes from a database table/column. */
+  db?: DbRef;
+  translate?: Translation;
   n: number;
   from: Path;
   to: Path;
@@ -147,13 +167,17 @@ export function buildReport(saved: Saved | null) {
     from: m[primary],
     to: m[secondary],
     color: COLORS[i % COLORS.length],
+    mapping: m,
   }));
+  const { inputs, constants } = engineInputs(saved.mappings ?? [], primary, secondary, src.fixed, dst.fixed);
   const mapped = applyWithHeaders(
     { body: src.data, headers: srcHeaders },
     { body: dst.data, headers: dstHeaders },
-    pairs.map((m) => ({ from: m.from, to: m.to })),
+    inputs,
     joins,
+    constants,
   );
+  const targetTags = dst.fixed ?? {};
   const result = mapped.body;
   const resultHeaders = dstHeaders ? mapped.headers : undefined;
 
@@ -161,6 +185,7 @@ export function buildReport(saved: Saved | null) {
   const groups = new Map<string, typeof pairs>();
   for (const p of pairs) {
     const id = pathId(p.to);
+    if (id in targetTags) continue; // tagged targets always get their constant (listed below)
     groups.set(id, [...(groups.get(id) ?? []), p]);
   }
 
@@ -172,20 +197,33 @@ export function buildReport(saved: Saved | null) {
     const toType = findNode(dstTree, to)?.type;
     const written = valuesAtPath(result, resultHeaders, to);
     const combined = group.length > 1;
-    const parts: ReportMapping[] = group.map((p) => {
-      const fromType = findNode(srcTree, p.from)?.type;
-      const sourceValues = valuesAtPath(src.data!, srcHeaders, p.from);
+    const parts: ReportMapping[] = group.map(({ mapping, ...p }) => {
+      const isConst = isConstPath(p.from);
+      const fromType = isConst ? typeOf(mapping.constant ?? "") : findNode(srcTree, p.from)?.type;
+      const sourceValues = isConst ? [constantValue(mapping.constant, mapping.db)] : valuesAtPath(src.data!, srcHeaders, p.from);
+      const extraNotes = [
+        ...(isConst
+          ? [
+              mapping.db
+                ? `Comes from the ${describeDb(mapping.db)} (constant).`
+                : "A fixed value (constant), not read from the source.",
+            ]
+          : []),
+        ...(mapping.translate ? [`Values translated: ${describeTranslation(mapping.translate)}.`] : []),
+      ];
       return {
         ...p,
         n,
-        fromLabel: pathLabel(p.from),
+        ...(isConst ? { constant: mapping.constant ?? "", ...(mapping.db ? { db: mapping.db } : {}) } : {}),
+        ...(mapping.translate ? { translate: mapping.translate } : {}),
+        fromLabel: sourceLabel(mapping, primary),
         toLabel: pathLabel(to),
         fromType,
         toType,
         sourceValues,
         written,
         // Combined values are always text, so per-part type notes would be noise.
-        notes: combined ? [] : notesFor(p.from, to, fromType, toType, sourceValues.length),
+        notes: combined ? extraNotes : [...extraNotes, ...(isConst ? [] : notesFor(p.from, to, fromType, toType, sourceValues.length))],
       };
     });
     if (!combined) {
@@ -202,10 +240,39 @@ export function buildReport(saved: Saved | null) {
           parts,
           join: joins.get(targetId) ?? DEFAULT_JOIN,
           written,
-          notes: combinedNotes(parts, to, written),
+          notes: [...combinedNotes(parts, to, written), ...parts.flatMap((p) => p.notes.map((n) => `${p.fromLabel}: ${n}`))],
         },
       });
     }
+  }
+  // Fields tagged as constants on the target: each is its own entry.
+  for (const [key, tag] of Object.entries(targetTags)) {
+    n++;
+    const to = JSON.parse(key) as Path;
+    const value = constantValue(tag.value, tag.db);
+    entries.push({
+      kind: "single",
+      item: {
+        id: `tag:${key}`,
+        n,
+        from: [CONST, `dst:${key}`],
+        to,
+        color: COLORS[(pairs.length + n) % COLORS.length],
+        constant: tag.value,
+        ...(tag.db ? { db: tag.db } : {}),
+        fromLabel: tag.db ? `${describeDb(tag.db)} (constant)` : `${JSON.stringify(tag.value)} (constant)`,
+        toLabel: pathLabel(to),
+        fromType: typeOf(value),
+        toType: findNode(dstTree, to)?.type,
+        sourceValues: [value],
+        written: valuesAtPath(result, resultHeaders, to),
+        notes: [
+          tag.db
+            ? `Tagged as a constant on the target; comes from the ${describeDb(tag.db)}.`
+            : "Tagged as a constant on the target: always this value.",
+        ],
+      },
+    });
   }
   const singles = entries.flatMap((e) => (e.kind === "single" ? [e.item] : []));
   const combinedFields = entries.flatMap((e) => (e.kind === "combined" ? [e.item] : []));
@@ -213,7 +280,10 @@ export function buildReport(saved: Saved | null) {
   // A target field is covered when it, or an object/list containing it, is mapped.
   const targetLeaves = leafPaths(dstTree);
   const covered = (p: Path) => pairs.some((m) => isPrefix(m.to, p));
-  const links: DiagramLink[] = pairs.map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color }));
+  const links: DiagramLink[] = [
+    ...pairs.filter((m) => !(pathId(m.to) in targetTags)).map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color })),
+    ...singles.filter((m) => m.id.startsWith("tag:")).map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color })),
+  ];
 
   return {
     // Only computed in the browser (the workspace lives in localStorage), so "now" is when the report is viewed.
@@ -222,8 +292,11 @@ export function buildReport(saved: Saved | null) {
     secondary,
     src: { data: src.data, tree: srcTree, format: srcFormat },
     dst: { data: dst.data, tree: dstTree, format: dstFormat },
-    sourceTitle: `Source · ${formatInfo(srcFormat).label}`,
-    targetTitle: `Target · ${formatInfo(dstFormat).label}`,
+    // Object names (when set) replace "Source" / "Target".
+    sourceName: src.name?.trim() || "Source",
+    targetName: dst.name?.trim() || "Target",
+    sourceTitle: `${src.name?.trim() || "Source"} · ${formatInfo(srcFormat).label}`,
+    targetTitle: `${dst.name?.trim() || "Target"} · ${formatInfo(dstFormat).label}`,
     links,
     /** Number of individual source → target links. */
     linkCount: pairs.length,

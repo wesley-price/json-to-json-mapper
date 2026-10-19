@@ -8,10 +8,13 @@
 // download automatically.
 
 import Link from "next/link";
+import { dateStamp, fileSlug } from "@/lib/names";
+import { MultiReport } from "./MultiReport";
+import { type SavedMulti, buildMultiReport } from "./multi-model";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { formatInfo } from "@/lib/formats";
 import { pathId } from "@/lib/json-tree";
-import { MappingDiagram, allRows, excerptRows, excerptRowsMany } from "./MappingDiagram";
+import { MappingDiagram, allRows, constantRow, excerptRows, excerptRowsMany } from "./MappingDiagram";
 import {
   type ReportCombined,
   type ReportMapping,
@@ -35,8 +38,8 @@ const readSaved = () => {
   }
 };
 
-const fileName = (d: Date) =>
-  `mapping-report-${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}.pdf`;
+/** "<document-name>-report-2026-10-18.pdf" */
+const fileName = (docName: string, d: Date) => `${fileSlug(docName, "mapping")}-report-${dateStamp(d)}.pdf`;
 
 function Badge({ n, color }: { n: number; color: string }) {
   return (
@@ -69,7 +72,7 @@ function SingleCard({ m, report }: { m: ReportMapping; report: ReportModel }) {
       </h3>
       <MappingDiagram
         diagramId={m.id}
-        source={excerptRows(report.src.tree, m.from)}
+        source={m.constant !== undefined ? [constantRow(m.from, m.constant, m.db)] : excerptRows(report.src.tree, m.from)}
         target={excerptRows(report.dst.tree, m.to)}
         links={[{ from: pathId(m.from), to: pathId(m.to), color: m.color }]}
         sourceTitle={report.sourceTitle}
@@ -116,10 +119,13 @@ function CombinedCard({ c, report }: { c: ReportCombined; report: ReportModel })
       </h3>
       <MappingDiagram
         diagramId={c.id}
-        source={excerptRowsMany(
-          report.src.tree,
-          c.parts.map((p) => p.from),
-        )}
+        source={[
+          ...excerptRowsMany(
+            report.src.tree,
+            c.parts.filter((p) => p.constant === undefined).map((p) => p.from),
+          ),
+          ...c.parts.filter((p) => p.constant !== undefined).map((p) => constantRow(p.from, p.constant, p.db)),
+        ]}
         target={excerptRows(report.dst.tree, c.to)}
         links={c.parts.map((p) => ({ from: pathId(p.from), to: pathId(c.to), color: p.color }))}
         sourceTitle={report.sourceTitle}
@@ -161,28 +167,37 @@ function CombinedCard({ c, report }: { c: ReportCombined; report: ReportModel })
 
 export function MappingReport() {
   const raw = useSyncExternalStore(subscribe, readSaved, () => null);
-  const report = useMemo(() => {
-    if (!raw) return null;
+  // Multi-source mode gets its own report; otherwise the single-pair one.
+  const { report, multiReport, docName } = useMemo(() => {
+    const none = { report: null, multiReport: null, docName: "" };
+    if (!raw) return none;
     try {
-      return buildReport(JSON.parse(raw) as Saved);
+      const saved = JSON.parse(raw) as Saved & SavedMulti;
+      const name = (saved.docName ?? "").trim();
+      if (saved.multi?.enabled) return { report: null, multiReport: buildMultiReport(saved), docName: name };
+      return { report: buildReport(saved), multiReport: null, docName: name };
     } catch {
-      return null;
+      return none;
     }
   }, [raw]);
+  const generated = report?.generated ?? multiReport?.generated ?? null;
 
   const rootRef = useRef<HTMLDivElement>(null);
   const [pdfState, setPdfState] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
 
   const downloadPdf = async () => {
-    if (!report || pdfState.busy) return;
+    if ((!report && !multiReport) || !generated || pdfState.busy) return;
     setPdfState({ busy: true, error: null });
+    const diagram = (id: string) =>
+      rootRef.current?.querySelector<SVGSVGElement>(`svg[data-diagram="${CSS.escape(id)}"]`) ?? null;
     try {
-      const { downloadReportPdf } = await import("./pdf");
-      await downloadReportPdf(
-        report,
-        (id) => rootRef.current?.querySelector<SVGSVGElement>(`svg[data-diagram="${CSS.escape(id)}"]`) ?? null,
-        fileName(report.generated),
-      );
+      if (multiReport) {
+        const { downloadMultiReportPdf } = await import("./pdf-multi");
+        await downloadMultiReportPdf(multiReport, diagram, fileName(docName, generated));
+      } else if (report) {
+        const { downloadReportPdf } = await import("./pdf");
+        await downloadReportPdf(report, diagram, fileName(docName, generated), docName);
+      }
       setPdfState({ busy: false, error: null });
     } catch (e) {
       setPdfState({ busy: false, error: `Couldn't create the PDF: ${(e as Error).message}` });
@@ -193,15 +208,15 @@ export function MappingReport() {
   // so a refresh doesn't download again.
   const autoStarted = useRef(false);
   useEffect(() => {
-    if (!report || autoStarted.current || !new URLSearchParams(window.location.search).has("download")) return;
+    if ((!report && !multiReport) || autoStarted.current || !new URLSearchParams(window.location.search).has("download")) return;
     autoStarted.current = true;
     window.history.replaceState(null, "", window.location.pathname);
     void downloadPdf();
     // downloadPdf reads the latest report; running once per page load is intended
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [report]);
+  }, [report, multiReport]);
 
-  if (!report) {
+  if (!report && !multiReport) {
     return (
       <div className="mx-auto max-w-2xl p-10 text-zinc-800">
         <h1 className="text-xl font-semibold">Mapping report</h1>
@@ -216,11 +231,7 @@ export function MappingReport() {
     );
   }
 
-  const { src, dst, singles, combined, entries } = report;
-
-  return (
-    <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
-      {/* Screen-only toolbar */}
+  const toolbar = (
       <div className="no-print sticky top-0 z-10 -mx-10 mb-6 flex flex-wrap items-center gap-3 border-b border-zinc-200 bg-white/95 px-10 py-3 backdrop-blur">
         <Link href="/" className="text-sm text-blue-600 hover:underline">
           ← Back to the mapper
@@ -243,19 +254,37 @@ export function MappingReport() {
           </button>
         </div>
       </div>
+  );
 
+  if (multiReport) {
+    return (
+      <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
+        {toolbar}
+        <MultiReport report={multiReport} />
+      </div>
+    );
+  }
+  if (!report) return null;
+  const { src, dst, singles, combined, entries } = report;
+
+  return (
+    <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
+      {toolbar}
       {/* 1. Overview */}
       <section>
-        <h1 className="text-2xl font-semibold tracking-tight">Mapping report</h1>
+        {docName && <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Mapping report</p>}
+        <h1 className="text-2xl font-semibold tracking-tight">{docName || "Mapping report"}</h1>
         <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-sm">
           <dt className="text-zinc-500">Generated</dt>
           <dd>{report.generated.toLocaleString()}</dd>
           <dt className="text-zinc-500">Source</dt>
           <dd>
+            {report.sourceName !== "Source" && <span className="font-medium">{report.sourceName} · </span>}
             {formatInfo(src.format).label} ({report.primary} side)
           </dd>
           <dt className="text-zinc-500">Target</dt>
           <dd>
+            {report.targetName !== "Target" && <span className="font-medium">{report.targetName} · </span>}
             {formatInfo(dst.format).label} ({report.secondary} side)
           </dd>
           <dt className="text-zinc-500">Mappings</dt>
@@ -272,7 +301,14 @@ export function MappingReport() {
         <h2 className="mt-6 mb-2 text-base font-semibold">Overview</h2>
         <MappingDiagram
           diagramId="overview"
-          source={allRows(src.tree)}
+          source={[
+            ...allRows(src.tree),
+            // Constants have no source field; list them after the source tree so their lines have a start.
+            ...report.entries
+              .flatMap((e) => (e.kind === "single" ? [e.item] : e.item.parts))
+              .filter((p) => p.constant !== undefined)
+              .map((p) => constantRow(p.from, p.constant, p.db)),
+          ]}
           target={allRows(dst.tree)}
           links={report.links}
           sourceTitle={report.sourceTitle}

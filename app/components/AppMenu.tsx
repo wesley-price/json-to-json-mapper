@@ -19,6 +19,10 @@ interface Props {
   onImport: () => void;
   onLoadExample: (source: Format, target: Format) => void;
   onClear: () => void;
+  /** Multi-source mode: one standard (primary) object fed by several sources. */
+  multiMode: boolean;
+  onMultiMode: (on: boolean) => void;
+  onLoadMultiExample: () => void;
 }
 
 const CLOSE_DELAY = 250; // ms; lets the pointer cross the gap between button and panel
@@ -123,21 +127,15 @@ export function AppMenu(props: Props) {
           className="absolute right-0 top-full z-40 mt-1 w-72 overflow-hidden rounded-lg border border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
         >
           <Group title="Workspace">
-            <Item onClick={act(props.onSwap)}>⇄ Swap primary side</Item>
-            <label className="flex cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-              <span>✎ Both sides editable</span>
-              <span className="relative inline-flex h-4 w-7 items-center">
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={props.bothEditable}
-                  onChange={(e) => props.onBothEditable(e.target.checked)}
-                  className="peer sr-only"
-                />
-                <span className="absolute inset-0 rounded-full bg-zinc-300 transition-colors peer-checked:bg-blue-600 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-400 dark:bg-zinc-600" />
-                <span className="absolute left-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform peer-checked:translate-x-3" />
-              </span>
-            </label>
+            {/* The standard must stay the primary in multi-source mode. */}
+            {!props.multiMode && <Item onClick={act(props.onSwap)}>⇄ Swap primary side</Item>}
+            <SwitchRow label="✎ Both sides editable" checked={props.bothEditable} onChange={props.onBothEditable} />
+            <SwitchRow
+              label="⧉ Multi-source mode"
+              hint="Map several source objects (e.g. downstream errors) into one standard primary object"
+              checked={props.multiMode}
+              onChange={props.onMultiMode}
+            />
           </Group>
 
           <Group title="Export & import">
@@ -150,10 +148,25 @@ export function AppMenu(props: Props) {
             <Item onClick={act(props.onExport)} disabled={props.exportDisabled}>
               ⬇ Export to Excel
             </Item>
-            <Item onClick={act(props.onImport)}>⬆ Import from Excel…</Item>
+            <Item onClick={act(props.onImport)}>
+              ⬆ Import from Excel…
+            </Item>
           </Group>
 
           <Group title="Load example">
+            {props.multiMode ? (
+              <div className="flex flex-col gap-1.5 px-2 py-1 text-xs">
+                <p className="text-zinc-500">
+                  A standard error response fed by three downstream errors (JSON, XML, CSV), with cases.
+                </p>
+                <button
+                  onClick={act(props.onLoadMultiExample)}
+                  className="mt-0.5 rounded-md bg-zinc-900 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                >
+                  Load error example
+                </button>
+              </div>
+            ) : (
             <div className="flex flex-col gap-1.5 px-2 py-1 text-xs">
               <p className="text-zinc-500">An order (source) and an empty invoice (target).</p>
               {formatSelect("Source", source, setSource)}
@@ -165,6 +178,7 @@ export function AppMenu(props: Props) {
                 Load example
               </button>
             </div>
+            )}
           </Group>
 
           <Group title="Appearance">
@@ -182,6 +196,38 @@ export function AppMenu(props: Props) {
         </div>
       )}
     </div>
+  );
+}
+
+function SwitchRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <label
+      className="flex cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      title={hint}
+    >
+      <span>{label}</span>
+      <span className="relative inline-flex h-4 w-7 shrink-0 items-center">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="peer sr-only"
+        />
+        <span className="absolute inset-0 rounded-full bg-zinc-300 transition-colors peer-checked:bg-blue-600 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-400 dark:bg-zinc-600" />
+        <span className="absolute left-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform peer-checked:translate-x-3" />
+      </span>
+    </label>
   );
 }
 

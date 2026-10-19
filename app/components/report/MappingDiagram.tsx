@@ -225,3 +225,14 @@ export function excerptRowsMany(root: FieldNode, paths: Path[]): DiagramRow[] {
   for (const p of paths) for (let k = 1; k <= p.length; k++) keep.add(pathId(p.slice(0, k)));
   return allRows(root).filter((row) => keep.has(row.id));
 }
+
+/** A source row standing for a constant value (constants have no field in the source tree). */
+export function constantRow(path: Path, value: unknown, db?: { table: string; column: string }): DiagramRow {
+  return {
+    id: pathId(path),
+    label: db ? `db ${db.table}.${db.column}` : JSON.stringify(value ?? ""),
+    type: undefined,
+    sample: db ? "database constant" : "constant",
+    depth: 0,
+  };
+}

@@ -4,6 +4,17 @@
 
 import { type FlatLayout, type Format, defaultFlatLayout } from "./formats";
 import type { Headers } from "./headers";
+import type { Translation } from "./transforms";
+
+const PAYMENT_CODES: Translation = {
+  pairs: [
+    ["INSUFFICIENT_FUNDS", "PAY-001"],
+    ["CARD_EXPIRED", "PAY-002"],
+    ["CARD_DECLINED", "PAY-003"],
+  ],
+  otherwise: "default",
+  defaultValue: "GEN-500",
+};
 
 export interface ExampleFile {
   text: string;
@@ -142,3 +153,116 @@ export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> 
     },
   },
 };
+
+// ---------- Multi-source example: normalising downstream errors ----------
+
+export interface MultiExampleSource {
+  name: string;
+  format: Format;
+  text: string;
+  headers?: Headers;
+  cases: {
+    name: string;
+    when: { path: string[]; op: "gte" | "lt" | "equals"; value: string }[];
+    /** [source path, standard path] */
+    maps: [string[], string[]][];
+    /** [fixed value, standard path] */
+    constants?: [string, string[]][];
+    /** Translation tables, by the standard path they write (joined with "."). */
+    translate?: Record<string, Translation>;
+  }[];
+}
+
+/** The standard error response every downstream error is normalised into. */
+export const STANDARD_ERROR = {
+  error: { code: "", message: "", httpStatus: 0, retryable: false, correlationId: "", sourceSystem: "" },
+};
+
+export const MULTI_EXAMPLE: MultiExampleSource[] = [
+  {
+    name: "Payments API",
+    format: "json",
+    headers: { "x-request-id": "req-889" },
+    text: JSON.stringify(
+      { status: 402, errorCode: "INSUFFICIENT_FUNDS", errorMessage: "Card declined: insufficient funds", retry: false },
+      null,
+      2,
+    ),
+    cases: [
+      {
+        name: "Client errors (4xx)",
+        when: [
+          { path: ["status"], op: "gte", value: "400" },
+          { path: ["status"], op: "lt", value: "500" },
+        ],
+        maps: [
+          [["errorCode"], ["error", "code"]],
+          [["errorMessage"], ["error", "message"]],
+          [["status"], ["error", "httpStatus"]],
+          [["retry"], ["error", "retryable"]],
+          [["$headers", "x-request-id"], ["error", "correlationId"]],
+        ],
+        constants: [["payments", ["error", "sourceSystem"]]],
+        translate: { "error.code": PAYMENT_CODES },
+      },
+      {
+        name: "Otherwise",
+        when: [],
+        maps: [
+          [["errorCode"], ["error", "code"]],
+          [["errorMessage"], ["error", "message"]],
+          [["status"], ["error", "httpStatus"]],
+          [["$headers", "x-request-id"], ["error", "correlationId"]],
+        ],
+        constants: [["payments", ["error", "sourceSystem"]]],
+        translate: { "error.code": PAYMENT_CODES },
+      },
+    ],
+  },
+  {
+    name: "Inventory SOAP",
+    format: "xml",
+    text: `<?xml version="1.0" encoding="UTF-8"?>
+<Fault>
+  <faultcode>soap:Server</faultcode>
+  <faultstring>Stock service unavailable</faultstring>
+  <detail>
+    <errorId>INV-503</errorId>
+    <httpStatus>503</httpStatus>
+    <requestRef>r-77</requestRef>
+  </detail>
+</Fault>
+`,
+    cases: [
+      {
+        name: "All faults",
+        when: [],
+        maps: [
+          [["Fault", "detail", "errorId"], ["error", "code"]],
+          [["Fault", "faultstring"], ["error", "message"]],
+          [["Fault", "detail", "httpStatus"], ["error", "httpStatus"]],
+          [["Fault", "detail", "requestRef"], ["error", "correlationId"]],
+        ],
+        constants: [["inventory", ["error", "sourceSystem"]]],
+      },
+    ],
+  },
+  {
+    name: "Legacy batch",
+    format: "csv",
+    text: "code,text,ref\nE42,Account locked,LEG-9\n",
+    cases: [
+      {
+        name: "All rows",
+        when: [],
+        maps: [
+          [["[]", "code"], ["error", "code"]],
+          [["[]", "text"], ["error", "message"]],
+          [["[]", "ref"], ["error", "correlationId"]],
+        ],
+        constants: [["legacy", ["error", "sourceSystem"]]],
+        translate: { "error.code": { pairs: [["E42", "ACC-423"]], otherwise: "keep", defaultValue: "" } },
+      },
+    ],
+  },
+];

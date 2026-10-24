@@ -3,7 +3,7 @@
 // plus its sample run through the matching case. Used by the report page and
 // the PDF so they always agree.
 
-import { type FlatLayout, type Format, defaultFlatLayout, formatInfo, writeFormat } from "@/lib/formats";
+import { type FlatLayout, type Format, defaultFlatLayout, formatInfo, schemaTypes, writeFormat } from "@/lib/formats";
 import { HEADERS, type Headers, applyWithHeaders, lookupTree, supportsHeaders } from "@/lib/headers";
 import {
   type FieldNode,
@@ -12,6 +12,7 @@ import {
   type Path,
   type Side,
   buildTree,
+  flatten,
   isPrefix,
   joinsFor,
   pathId,
@@ -22,11 +23,15 @@ import { type FixedValues, describeDb, describeFixed, describeTranslation, engin
 import { type FieldDecisions, type FieldQuestions, type Spec, UNMAPPED_OPTIONS, UNMAPPED_SHORT, applyRules, normalizeSpec } from "@/lib/spec";
 import type { DiagramLink } from "./MappingDiagram";
 import { type TestCase, type TestCaseDraft, numberCases, someHeaders } from "./test-cases";
+import { mergeSources } from "@/lib/merge";
+import { dbConstantsOf, readinessOf } from "@/lib/readiness";
+import { unmappedFields } from "@/lib/spec";
 
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
 
 interface SavedSide {
   name?: string;
+  text?: string;
   data: Json | null;
   format?: Format;
   layout?: FlatLayout;
@@ -50,7 +55,7 @@ export interface SavedMulti {
   mappings: Mapping[];
   docName?: string;
   spec?: Partial<Spec>;
-  multi?: { enabled: boolean; sources: SavedSource[]; activeSource: string };
+  multi?: { enabled: boolean; sources: SavedSource[]; activeSource: string; combine?: "each" | "merge" };
 }
 
 export interface MultiReportMapping {
@@ -134,6 +139,7 @@ export function buildMultiReport(saved: SavedMulti | null) {
   const stdFormat = standardSide.format ?? "json";
   const stdTree = treeOf(standardSide);
   const stdFields = leafPaths(stdTree).filter((p) => !(p.length === 1 && p[0] === HEADERS));
+  const stdSchema = schemaTypes(standardSide.format ?? "json", standardSide.text);
 
   let colorIndex = 0;
   const reportSources: MultiReportSource[] = sources.map((src, si) => {
@@ -142,6 +148,7 @@ export function buildMultiReport(saved: SavedMulti | null) {
     const body = side.data;
     const headers = activeHeaders(side);
     const firstMatch = body === null ? null : pickCase(src.cases, body, headers);
+    const srcSchema = schemaTypes(side.format ?? "json", side.text);
 
     const cases: MultiReportCase[] = src.cases.map((c, ci) => {
       const groups = new Map<string, Mapping[]>();
@@ -151,7 +158,10 @@ export function buildMultiReport(saved: SavedMulti | null) {
         const isConst = isConstPath(from);
         const group = groups.get(pathId(m[primary])) ?? [];
         const tag = side.fixed?.[pathId(from)];
+        const fromSchema = isConst ? undefined : srcSchema.get(pathId(from));
+        const toSchema = stdSchema.get(pathId(m[primary]));
         const notes = [
+          ...(fromSchema || toSchema ? [`Schema types: ${fromSchema ?? "?"} → ${toSchema ?? "?"}.`] : []),
           ...(isConst ? [m.db ? `Comes from the ${describeDb(m.db)}.` : "A fixed value (constant)."] : []),
           ...(tag ? [`Source field tagged as a constant: ${describeFixed(tag)}.`] : []),
           ...(m.translate ? [`Values translated: ${describeTranslation(m.translate)}.`] : []),
@@ -210,15 +220,27 @@ export function buildMultiReport(saved: SavedMulti | null) {
           spec,
         },
       );
-      return { caseName: kase.name, text: writeFormat(stdFormat, out.body, standardSide.layout ?? defaultFlatLayout()), out };
+      return { caseName: kase.name, text: writeFormat(stdFormat, out.body, standardSide.layout ?? defaultFlatLayout(), standardSide.text), out };
     };
     // Every message of this source becomes a test case: input -> expected output.
     const drafts: TestCaseDraft[] = [];
-    const addCase = (title: string, msgBody: Json, msgHeaders: Headers | undefined, r: MultiReportTest) =>
+    const sampleTitle = `${src.name} · sample`;
+    let sampleOut: Record<string, Json> | null = null;
+    /** Output fields that differ from the sample's output. */
+    const outputChanges = (r: MultiReportTest) => {
+      if ("error" in r || !sampleOut) return [];
+      const now = flatten(r.out.body);
+      const keys = new Set([...Object.keys(sampleOut), ...Object.keys(now)]);
+      return [...keys]
+        .filter((k) => JSON.stringify(now[k]) !== JSON.stringify(sampleOut![k]))
+        .map((k) => ({ field: k, value: k in now ? JSON.stringify(now[k]) : "(left out)" }));
+    };
+    const addCase = (title: string, msgBody: Json, msgHeaders: Headers | undefined, r: MultiReportTest, changes?: string) =>
       drafts.push({
+        ...(changes !== undefined ? { variant: { of: sampleTitle, inputChanges: changes, outputChanges: outputChanges(r) } } : {}),
         title: `${src.name} · ${title}`,
         source: src.name,
-        input: { body: msgBody, headers: someHeaders(msgHeaders), text: writeFormat(side.format ?? "json", msgBody, side.layout ?? defaultFlatLayout()) },
+        input: { body: msgBody, headers: someHeaders(msgHeaders), text: writeFormat(side.format ?? "json", msgBody, side.layout ?? defaultFlatLayout(), side.text) },
         ...("error" in r
           ? { error: r.error }
           : {
@@ -227,14 +249,17 @@ export function buildMultiReport(saved: SavedMulti | null) {
             }),
       });
     const test: MultiReportTest = body === null ? { error: "No sample loaded." } : run(body, headers);
-    if (body !== null) addCase("sample", body, headers, test);
+    if (body !== null) {
+      addCase("sample", body, headers, test);
+      if (!("error" in test)) sampleOut = flatten(test.out.body);
+    }
     const examples =
       body === null
         ? []
         : (src.examples ?? []).map((ex) => {
             const msg = applyExample(body, headers, ex.values);
             const r = run(msg.body, msg.headers);
-            addCase(`example "${ex.name}"`, msg.body, msg.headers, r);
+            addCase(`example "${ex.name}"`, msg.body, msg.headers, r, describeExample(ex.values, pathLabel));
             return { name: ex.name, changes: describeExample(ex.values, pathLabel), test: r };
           });
 
@@ -245,7 +270,7 @@ export function buildMultiReport(saved: SavedMulti | null) {
             values.map((value) => {
               const msg = applyExample(body, headers, { [id]: value });
               const r = run(msg.body, msg.headers);
-              addCase(`${pathLabel(JSON.parse(id) as Path)} = ${JSON.stringify(value)}`, msg.body, msg.headers, r);
+              addCase(`${pathLabel(JSON.parse(id) as Path)} = ${JSON.stringify(value)}`, msg.body, msg.headers, r, `${pathLabel(JSON.parse(id) as Path)} = ${JSON.stringify(value)}`);
               return {
                 field: pathLabel(JSON.parse(id) as Path),
                 value: JSON.stringify(value),
@@ -260,6 +285,33 @@ export function buildMultiReport(saved: SavedMulti | null) {
 
   // Coverage: which source field feeds each standard field (per case where they differ).
   const stdFixed = standardSide.fixed ?? {};
+  // Merged mode: all sources fill one object together.
+  const merge = saved.multi.combine === "merge";
+  const merged = merge
+    ? mergeSources(
+        standardSide,
+        sources.map((s) => ({ name: s.name, side: s.side ?? { data: null }, cases: s.cases })),
+        primary,
+        spec,
+      )
+    : null;
+  if (merged) {
+    const inputs = sources.filter((s) => s.side?.data != null);
+    reportSources[0]?.drafts.unshift({
+      title: "All sources merged into one",
+      input: {
+        // Each source as { body, headers } (the generated mapAll takes the same shape).
+        body: Object.fromEntries(
+          inputs.map((s) => [s.name, { body: s.side.data as Json, ...(activeHeaders(s.side) ? { headers: activeHeaders(s.side) as Json } : {}) }]),
+        ),
+        text: inputs
+          .map((s) => `-- ${s.name} --\n${writeFormat(s.side.format ?? "json", s.side.data as Json, s.side.layout ?? defaultFlatLayout(), s.side.text)}`)
+          .join("\n"),
+      },
+      expected: { body: merged.body, headers: supportsHeaders(stdFormat) ? someHeaders(merged.headers) : undefined, text: merged.text },
+    });
+  }
+
   const coverage = stdFields.map((path) => ({
     path,
     label: pathLabel(path),
@@ -277,6 +329,10 @@ export function buildMultiReport(saved: SavedMulti | null) {
         const decided = standardSide.decisions?.[pathId(path)];
         const gets = UNMAPPED_OPTIONS.find((o) => o.id === (decided ?? spec.unmapped))!;
         const short = UNMAPPED_SHORT[gets.id];
+        // Merged: only a gap when no source at all feeds the field.
+        const fedElsewhere =
+          merge && sources.some((o) => o.cases.some((c) => c.mappings.some((m) => isPrefix(m[primary], path))));
+        if (fedElsewhere) return { text: "— (another source)", gap: false };
         return { text: `— (${short}${decided ? "" : ", by rule"})`, gap: !decided || gets.id === "ask" };
       }
       const same = mapped.length === perCase.length && mapped.every((c) => c.fields.join() === mapped[0].fields.join());
@@ -301,11 +357,36 @@ export function buildMultiReport(saved: SavedMulti | null) {
     coverage,
     /** Standard fields tagged as constants: the same value whatever the source. */
     spec,
+    /** "merge": all sources fill one object together (see merged). */
+    combine: (merge ? "merge" : "each") as "merge" | "each",
+    merged,
     /** Unmapped standard fields marked "ask a subject-matter expert", with their questions. */
     openQuestions: stdFields
       .filter((p) => !(pathId(p) in stdFixed) && (standardSide.decisions?.[pathId(p)] ?? spec.unmapped) === "ask")
       .filter((p) => reportSources.every((s) => s.cases.every((c) => !c.mappings.some((m) => isPrefix(m.to, p)))))
       .map((p) => ({ field: pathLabel(p), question: standardSide.questions?.[pathId(p)]?.trim() ?? "" })),
+    /** Is it ready to build? (the report's first page) */
+    readiness: readinessOf({
+      targetFieldCount: stdFields.length,
+      // Fields no source maps at all (a field one source maps is covered when merging; per source otherwise, see coverage).
+      unmapped: unmappedFields(
+        stdTree,
+        sources.flatMap((s) => s.cases.flatMap((c) => c.mappings.map((m) => m[primary]))),
+        standardSide.fixed,
+        standardSide.decisions,
+        spec,
+        standardSide.questions,
+      ),
+      dbConstants: dbConstantsOf(
+        sources.flatMap((s) => s.cases.flatMap((c) => c.mappings)),
+        primary,
+        [standardSide.fixed, ...sources.map((s) => s.side?.fixed)],
+      ),
+      conflicts: merged ? merged.conflicts : undefined,
+      noCase: reportSources.filter((s) => "error" in s.test && /no case/i.test(s.test.error)).map((s) => s.name),
+      coverageGaps: merge ? undefined : coverage.flatMap((row) => row.cells.flatMap((c, i) => (c.gap ? [`${sources[i].name}: ${row.label}`] : []))),
+      spec,
+    }),
     /** Every message as an input with its expected output. */
     testCases: numberCases(reportSources.flatMap((s) => s.drafts)) as TestCase[],
     standardConstants: Object.entries(stdFixed).map(([id, tag]) => ({ label: pathLabel(JSON.parse(id) as Path), text: describeFixed(tag) })),

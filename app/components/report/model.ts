@@ -2,7 +2,7 @@
 // Both the on-screen/printable report and the downloadable PDF use this, so
 // they always say the same thing.
 
-import { type FlatLayout, type Format, defaultFlatLayout, formatInfo, writeFormat } from "@/lib/formats";
+import { type FlatLayout, type Format, defaultFlatLayout, formatInfo, schemaTypes, writeFormat } from "@/lib/formats";
 import {
   ARRAY_ITEM,
   type FieldNode,
@@ -36,12 +36,15 @@ import {
 import { type Headers, applyWithHeaders, headersText, lookupTree, supportsHeaders, valuesAtPath } from "@/lib/headers";
 import { type FieldDecisions, type FieldQuestions, type Spec, UNMAPPED_OPTIONS, applyRules, normalizeSpec, unmappedFields } from "@/lib/spec";
 import { type TestCase, numberCases, someHeaders } from "./test-cases";
+import { dbConstantsOf, readinessOf } from "@/lib/readiness";
 
 export const STORAGE_KEY = "object-mapper:v1";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
 
 interface SavedSide {
   name?: string;
+  /** The object's text as last loaded or edited (a table's CREATE TABLE keeps its column types). */
+  text?: string;
   data: Json | null;
   format?: Format;
   layout?: FlatLayout;
@@ -75,6 +78,9 @@ export interface ReportMapping {
   color: string;
   fromType?: FieldType;
   toType?: FieldType;
+  /** Declared types from the objects' schemas (Avro, CREATE TABLE), when there are any. */
+  fromSchema?: string;
+  toSchema?: string;
   /** Example values read from the source, and the values written to the target. */
   sourceValues: Json[];
   written: Json[];
@@ -209,6 +215,9 @@ export function buildReport(saved: Saved | null) {
   }
 
   const entries: ReportEntry[] = [];
+  // Declared types from each object's schema (Avro, CREATE TABLE), by path.
+  const srcSchema = schemaTypes(srcFormat, src.text);
+  const dstSchema = schemaTypes(dstFormat, dst.text);
   let n = 0;
   for (const [targetId, group] of groups) {
     n++;
@@ -220,7 +229,10 @@ export function buildReport(saved: Saved | null) {
       const isConst = isConstPath(p.from);
       const fromType = isConst ? typeOf(mapping.constant ?? "") : findNode(srcTree, p.from)?.type;
       const sourceValues = isConst ? [constantValue(mapping.constant, mapping.db)] : valuesAtPath(src.data!, srcHeaders, p.from);
+      const fromSchema = isConst ? undefined : srcSchema.get(pathId(p.from));
+      const toSchema = dstSchema.get(pathId(to));
       const extraNotes = [
+        ...(fromSchema || toSchema ? [`Schema types: ${fromSchema ?? fromType ?? "?"} → ${toSchema ?? toType ?? "?"}.`] : []),
         ...(isConst
           ? [
               mapping.db
@@ -240,6 +252,8 @@ export function buildReport(saved: Saved | null) {
         toLabel: pathLabel(to),
         fromType,
         toType,
+        ...(fromSchema ? { fromSchema } : {}),
+        ...(toSchema ? { toSchema } : {}),
         sourceValues,
         written,
         // Combined values are always text, so per-part type notes would be noise.
@@ -324,7 +338,7 @@ export function buildReport(saved: Saved | null) {
     singles,
     combined: combinedFields,
     result,
-    resultText: writeFormat(dstFormat, result, dstLayout),
+    resultText: writeFormat(dstFormat, result, dstLayout, dst.text),
     /** The target's headers after mapping as "name: value" lines (empty when none). */
     resultHeadersText: resultHeaders && Object.keys(resultHeaders).length ? headersText(resultHeaders) : "",
     /** Target fields no mapping writes, with what each gets (its decision or the document rule). */
@@ -344,11 +358,18 @@ export function buildReport(saved: Saved | null) {
     })),
     spec,
     /** The sample as an input with its expected output. */
+    /** Is it ready to build? (the report's first page) */
+    readiness: readinessOf({
+      targetFieldCount: targetLeaves.length,
+      unmapped: unmappedFields(lookupTree(dst.data, dstHeaders), (saved.mappings ?? []).map((m) => m[secondary]), dst.fixed, dst.decisions, spec, dst.questions),
+      dbConstants: dbConstantsOf(saved.mappings ?? [], secondary, [src.fixed, dst.fixed]),
+      spec,
+    }),
     testCases: numberCases([
       {
         title: `${src.name?.trim() || "Source"} sample`,
-        input: { body: src.data, headers: someHeaders(srcHeaders), text: writeFormat(srcFormat, src.data, src.layout ?? defaultFlatLayout()) },
-        expected: { body: result, headers: someHeaders(resultHeaders), text: writeFormat(dstFormat, result, dstLayout) },
+        input: { body: src.data, headers: someHeaders(srcHeaders), text: writeFormat(srcFormat, src.data, src.layout ?? defaultFlatLayout(), src.text) },
+        expected: { body: result, headers: someHeaders(resultHeaders), text: writeFormat(dstFormat, result, dstLayout, dst.text) },
       },
     ]) as TestCase[],
     targetLeafCount: targetLeaves.length,

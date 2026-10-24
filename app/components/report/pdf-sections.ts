@@ -5,6 +5,49 @@ import type { jsPDF } from "jspdf";
 import { type Spec, describeRules } from "@/lib/spec";
 import { pdfText } from "./pdf";
 import type { TestCase } from "./test-cases";
+import { type ReadinessItem, readinessCounts } from "@/lib/readiness";
+
+/** The readiness checklist, drawn at y on the current page; returns the y below it. */
+export function drawReadiness(doc: jsPDF, items: ReadinessItem[], y: number): number {
+  const { warnings } = readinessCounts(items);
+  const color = { ok: "#10b981", warn: "#f59e0b", info: "#0ea5e9" } as const;
+  const rows = items.map((it) => {
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    const detail = [it.detail, it.items.length ? it.items.slice(0, 8).join(" · ") + (it.items.length > 8 ? ` · …${it.items.length - 8} more` : "") : ""].filter(Boolean).join("  ");
+    const lines = detail ? (doc.splitTextToSize(pdfText(detail), CONTENT_W - 10) as string[]) : [];
+    return { it, lines, h: 4.4 + lines.length * 3.4 + 1.2 };
+  });
+  const total = 9 + rows.reduce((n, r) => n + r.h, 0);
+  if (y + total > PAGE_H - MARGIN - 6) {
+    doc.addPage();
+    y = MARGIN;
+  }
+  doc.setFillColor(warnings ? "#fffbeb" : "#ecfdf5");
+  doc.setDrawColor(warnings ? "#fcd34d" : "#6ee7b7");
+  doc.setLineWidth(0.3);
+  doc.roundedRect(MARGIN, y, CONTENT_W, total, 2, 2, "FD");
+  let cy = y + 6;
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(10.5);
+  doc.setTextColor("#18181b");
+  doc.text(pdfText(`Ready to build? ${warnings ? `- ${warnings} item${warnings === 1 ? "" : "s"} to check` : "- yes"}`), MARGIN + 4, cy);
+  cy += 5;
+  for (const r of rows) {
+    doc.setFillColor(color[r.it.status]);
+    doc.circle(MARGIN + 5, cy - 1.1, 0.9, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.setTextColor("#18181b");
+    doc.text(pdfText(r.it.title), MARGIN + 8, cy);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor("#52525b");
+    r.lines.forEach((l, i) => doc.text(l, MARGIN + 8, cy + 3.6 + i * 3.4));
+    cy += r.h;
+  }
+  return y + total + 7;
+}
 
 const PAGE_H = 297;
 const MARGIN = 14;
@@ -65,8 +108,11 @@ export function drawRulesPage(
   spec: Spec,
   docName: string,
   questions: { field: string; question: string; scenario?: string }[] = [],
+  /** Called once the page is added (for bookmarks). */
+  onStart?: () => void,
 ) {
   const p = pen(doc);
+  onStart?.();
   if (questions.length) {
     p.font("helvetica", "bold", 12, "#78350f");
     doc.text(pdfText(`Open questions (${questions.length}) - ask a subject-matter expert`), MARGIN, p.y + 4);
@@ -118,10 +164,38 @@ export function drawRulesPage(
   }
 }
 
+/** "Reference implementation": status, how to use it, and the mapping data (the runtime is in the downloaded file). */
+export function drawImplementation(
+  doc: jsPDF,
+  impl: { dataPart: string; functions: Record<string, string>; mergeFunction?: string },
+  name: string,
+  check: ReadinessItem | undefined,
+  onStart?: () => void,
+) {
+  const p = pen(doc);
+  onStart?.();
+  p.font("helvetica", "bold", 15);
+  doc.text(pdfText(`Reference implementation${name ? ` - ${name}` : ""}`), MARGIN, p.y + 4);
+  p.y += 11;
+  p.font("helvetica", "normal", 9, "#3f3f46");
+  const fns = [...Object.values(impl.functions), ...(impl.mergeFunction ? [impl.mergeFunction] : [])].map((f) => `${f}(...)`).join(", ");
+  p.para(
+    `Plain JavaScript that does exactly what this report describes: the mapping as data, plus a small runtime with the same rules (in the downloadable .js file from the report page). Call ${fns}. Database constants go through lookupDatabase(): replace it with a real query.`,
+  );
+  if (check) {
+    p.y += 1;
+    p.font("helvetica", "bold", 9, check.status === "warn" ? "#b45309" : "#047857");
+    p.para(`${check.title}${check.items.length ? ` - ${check.items.join("; ")}` : ""}`);
+  }
+  p.y += 2;
+  p.mono(impl.dataPart);
+}
+
 /** "Test cases": every input with the output the implementation must produce. */
-export function drawTestCases(doc: jsPDF, cases: TestCase[]) {
+export function drawTestCases(doc: jsPDF, cases: TestCase[], onStart?: () => void) {
   if (!cases.length) return;
   const p = pen(doc);
+  onStart?.();
   p.font("helvetica", "bold", 15);
   doc.text("Test cases", MARGIN, p.y + 4);
   p.y += 11;
@@ -141,6 +215,18 @@ export function drawTestCases(doc: jsPDF, cases: TestCase[]) {
     p.font("helvetica", "normal", 8, c.error ? "#b45309" : "#71717a");
     p.para(c.error ? `Expected: ${c.error}` : c.caseName ? `Uses case "${c.caseName}"` : "");
     p.y += 1;
+    if (c.variant) {
+      // A variant: only what differs from its base case (the JSON file has it in full).
+      p.font("helvetica", "normal", 8.5, "#3f3f46");
+      p.para(`Input: same as ${c.variant.of}, except ${c.variant.inputChanges}`);
+      if (c.expected)
+        p.para(
+          c.variant.outputChanges.length
+            ? `Expected output: same as ${c.variant.of}, except ${c.variant.outputChanges.map((x) => `${x.field} = ${x.value}`).join(", ")}`
+            : `Expected output: same as ${c.variant.of}`,
+        );
+      continue;
+    }
     p.font("helvetica", "bold", 8, "#52525b");
     doc.text("Input", MARGIN, p.y);
     p.y += 3.6;

@@ -21,13 +21,26 @@ export interface TestCase {
   expected?: { body: Json; headers?: Headers; text: string };
   /** Why there is no expected output (e.g. no case matches). */
   error?: string;
+  /** A variant of another test case (an example or extra value of the same sample). */
+  variant?: {
+    /** The test case it varies (its id once numbered; the title before). */
+    of: string;
+    /** What differs in the input, in words. */
+    inputChanges: string;
+    /** Output fields that differ from that test case's output. */
+    outputChanges: { field: string; value: string }[];
+  };
 }
 
 /** A test case before numbering. */
 export type TestCaseDraft = Omit<TestCase, "id">;
 
-export const numberCases = (drafts: TestCaseDraft[], start = 1): TestCase[] =>
-  drafts.map((d, i) => ({ id: `TC${start + i}`, ...d }));
+/** Number the cases; variants then point at their base case by id. */
+export function numberCases(drafts: TestCaseDraft[], start = 1): TestCase[] {
+  const cases = drafts.map((d, i) => ({ id: `TC${start + i}`, ...d }));
+  const byTitle = new Map(cases.map((c) => [c.title, c.id]));
+  return cases.map((c) => (c.variant ? { ...c, variant: { ...c.variant, of: byTitle.get(c.variant.of) ?? c.variant.of } } : c));
+}
 
 /** Headers worth showing (none when empty). */
 export const someHeaders = (h: Headers | undefined) => (h && Object.keys(h).length ? h : undefined);

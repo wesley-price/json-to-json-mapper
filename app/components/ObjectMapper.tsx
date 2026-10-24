@@ -36,12 +36,13 @@ import {
   FORMATS,
   PLACEHOLDERS,
   defaultFlatLayout,
+  schemaTypes,
   formatInfo,
   readFormat,
   writeFormat,
 } from "@/lib/formats";
 import { SECTIONS, type SectionName, guessDelimiter, syncLayoutFields } from "@/lib/formats/flat";
-import { EXAMPLES, MULTI_EXAMPLE, STANDARD_ERROR } from "@/lib/examples";
+import { EXAMPLES, MERGE_EXAMPLE, MERGE_STANDARD, MULTI_EXAMPLE, STANDARD_ERROR } from "@/lib/examples";
 import { DEFAULT_DOC_NAME, fileSlug } from "@/lib/names";
 import {
   type Condition,
@@ -56,6 +57,12 @@ import { MultiBar } from "./MultiBar";
 import { type ReusableObject, ScenarioBar } from "./ScenarioBar";
 import { type ExampleField, type ExampleOutcome, SourceExamples } from "./SourceExamples";
 import { SpecDialog } from "./SpecDialog";
+import { ReadinessPanel } from "./ReadinessPanel";
+import { Icon } from "./Icon";
+import { dbConstantsOf, readinessOf } from "@/lib/readiness";
+import { deleteDoc, documentFile, newDocId, readDoc, readDocumentFile, storeDoc } from "@/lib/documents";
+import { type CanvasCard, type CanvasField, type CanvasLink, type CanvasPositions, MapCanvas } from "./MapCanvas";
+import { type CombineMode, type MergeResult, mergeSources } from "@/lib/merge";
 import { UnmappedChip, unmappedTag } from "./UnmappedFields";
 import { ConstantFields, ConstantForm, TranslationEditor, draftOf, fromDraft } from "./TranslationEditor";
 import {
@@ -81,7 +88,7 @@ import {
 } from "@/lib/headers";
 import { buildWorkbook, parseWorkbook, readDocument } from "@/lib/workbook";
 import { type MultiDoc, type MultiDocSide, buildMultiWorkbook, parseMultiWorkbook } from "@/lib/multi-workbook";
-import { type Sheet, downloadXlsx, readXlsx } from "@/lib/xlsx";
+import { type Sheet, chunkText, downloadXlsx, oversizedCells, readXlsx } from "@/lib/xlsx";
 import {
   DEFAULT_SPEC,
   type FieldDecision,
@@ -104,6 +111,54 @@ const OUTPUT_COLLAPSED_KEY = "object-mapper:output-collapsed";
 const MULTI_COLLAPSED_KEY = "object-mapper:multi-collapsed";
 const UNMAPPED_QUIET_KEY = "object-mapper:unmapped-highlight-off";
 const HELP_HIDDEN_KEY = "object-mapper:help-hidden";
+const CANVAS_VIEW_KEY = "object-mapper:canvas-view";
+const CARD_COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
+
+/** While searching a tree: matching fields (by name or path), their parents and their children. */
+function visibleForSearch(tree: FieldNode | null, query: string): Set<string> | undefined {
+  const q = query.trim().toLowerCase();
+  if (!q || !tree) return undefined;
+  const out = new Set<string>();
+  const addAll = (n: FieldNode) => {
+    out.add(pathId(n.path));
+    n.children.forEach(addAll);
+  };
+  const walk = (n: FieldNode): boolean => {
+    const label = pathLabel(n.path).toLowerCase();
+    if (n.path.length && (label.includes(q) || String(n.key).toLowerCase().includes(q))) {
+      addAll(n);
+      return true;
+    }
+    let any = false;
+    for (const c of n.children) if (walk(c)) any = true;
+    if (any) out.add(pathId(n.path));
+    return any;
+  };
+  walk(tree);
+  return out;
+}
+
+/** Rows for a canvas card: every field of the tree (headers first), indented by depth. */
+function canvasFields(tree: FieldNode | null, valueAt?: (p: Path) => Json | undefined): CanvasField[] {
+  const out: CanvasField[] = [];
+  const show = (v: Json | undefined) =>
+    v === undefined ? undefined : v === null ? "null" : typeof v === "object" ? (Array.isArray(v) ? `[${v.length}]` : "{…}") : JSON.stringify(v);
+  const walk = (node: FieldNode, depth: number) => {
+    for (const c of node.children) {
+      const isObj = c.type === "object" || c.type === "array";
+      out.push({
+        pid: pathId(c.path),
+        label: c.key === HEADERS ? "Headers" : c.key === "[]" ? "each item" : String(c.key),
+        depth,
+        type: c.type,
+        value: isObj ? undefined : show(valueAt ? valueAt(c.path) : c.sample),
+      });
+      walk(c, depth + 1);
+    }
+  };
+  if (tree) walk(tree, 0);
+  return out;
+}
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
 
 interface SideState {
@@ -171,6 +226,10 @@ interface MultiState {
   standard: SideState | null;
   /** The single-pair setup to restore when multi-source mode is turned off. */
   single: { primary: SideState; side: SideState; mappings: Mapping[] } | null;
+  /** How sources combine: each on its own (default) or all merged into one object. */
+  combine?: CombineMode;
+  /** Where each card sits on the canvas view (by source id, or "standard"). */
+  canvas?: CanvasPositions;
 }
 
 /** One complete mapping setup with its own primary (e.g. "200 OK" or "422 Unprocessable"). */
@@ -321,7 +380,7 @@ function runMessage(src: SourceState, std: SideState, primary: Side, body: Json,
   const hasHeaders = supportsHeaders(std.format) && Object.keys(out.headers).length > 0;
   return {
     caseName: kase.name,
-    text: writeFormat(std.format, out.body, std.layout),
+    text: writeFormat(std.format, out.body, std.layout, std.text),
     body: out.body,
     headers: hasHeaders ? out.headers : null,
   };
@@ -352,8 +411,19 @@ function testRunsOf({ sides, primary, multi }: Work, sources: SourceState[], spe
   });
 }
 
+/** Merged mode: every source filling the standard together. */
+function mergeOf({ sides, primary, multi }: Work, sources: SourceState[], spec: Spec): MergeResult | null {
+  if (!multi.enabled || multi.combine !== "merge") return null;
+  return mergeSources(
+    sides[primary],
+    sources.map((s) => ({ name: s.name, side: s.side, cases: s.cases })),
+    primary,
+    spec,
+  );
+}
+
 /** A multi-source scenario as a plain document (sources map into the standard). */
-function multiDocOf({ sides, primary }: Work, sources: SourceState[], docName: string): MultiDoc {
+function multiDocOf({ sides, primary, multi }: Work, sources: SourceState[], docName: string): MultiDoc {
   const secondary = other(primary);
   const docSide = (st: SideState): MultiDocSide => ({
     name: st.name ?? "",
@@ -362,10 +432,12 @@ function multiDocOf({ sides, primary }: Work, sources: SourceState[], docName: s
     layout: st.layout,
     headers: st.headers ?? {},
     fixed: st.fixed ?? {},
+    schemaTypes: schemaTypes(st.format, st.text),
     ...(st.moreValues && Object.keys(st.moreValues).length ? { moreValues: st.moreValues } : {}),
   });
   return {
     docName,
+    combine: multi.combine ?? "each",
     standard: docSide(sides[primary]),
     sources: sources.map((src) => ({
       name: src.name,
@@ -393,10 +465,100 @@ function multiDocOf({ sides, primary }: Work, sources: SourceState[], docName: s
 }
 
 /** The spec rows on the Document sheet, plus an "Unmapped" sheet with per-field decisions. */
-function withSpec(sheets: Sheet[], spec: Spec, decisions: [string, string, string, string][]): Sheet[] {
+function withSpec(
+  sheets: Sheet[],
+  spec: Spec,
+  decisions: [string, string, string, string][],
+  /** Table-format objects: [object, its CREATE TABLE text], so declared column types survive Excel. */
+  tables: [string, SideState][] = [],
+): Sheet[] {
   const out = sheets.map((sh) => (sh.name === "Document" ? { ...sh, rows: [...sh.rows, ...specRows(spec)] } : sh));
   if (decisions.length) out.push({ name: "Unmapped", rows: [["Object", "Field", "Decision", "Question"], ...decisions] });
+  // Schemas the object was defined with (a table's CREATE TABLE, an Avro schema), so declared types survive Excel.
+  const defs = tables.filter(
+    ([, st]) =>
+      (st.format === "table" && /create\s+table/i.test(st.text)) ||
+      (st.format === "avro" && st.text.trim().startsWith("{")) ||
+      (st.format === "kafka" && schemaTypes("kafka", st.text).size > 0),
+  );
+  // Long definitions continue on following rows with the same object (Excel caps a cell at 32,767 characters).
+  if (defs.length) out.push({ name: "Schemas", rows: [["Object", "Definition"], ...defs.flatMap(([o, st]) => chunkText(st.text).map((part) => [o, part]))] });
   return out;
+}
+
+/** The setup the multi-source switch set aside (the single pair while multi-source is on, or the sources while it is off). */
+type Stash =
+  | { kind: "single"; single: NonNullable<MultiState["single"]> }
+  | {
+      kind: "multi";
+      standard: SideState | null;
+      sources: SourceState[];
+      activeSource: string;
+      standardSide: Side | null;
+      combine?: CombineMode;
+    };
+
+function stashOf({ multi }: Work): Stash | null {
+  if (multi.enabled) return multi.single ? { kind: "single", single: multi.single } : null;
+  if (!multi.sources.length) return null;
+  return {
+    kind: "multi",
+    standard: multi.standard,
+    sources: multi.sources,
+    activeSource: multi.activeSource,
+    standardSide: multi.standardSide,
+    combine: multi.combine,
+  };
+}
+
+/** The set-aside setup as JSON, split over rows so no cell exceeds Excel's limit. */
+function stashSheet(stash: Stash): Sheet {
+  return {
+    name: "Set aside",
+    rows: [
+      ["Part", `Kept by the mapper: the ${stash.kind === "single" ? "single-pair setup" : "multi-source sources"} set aside by the multi-source switch`],
+      ...chunkText(JSON.stringify(stash)).map((part, i) => [i + 1, part]),
+    ],
+  };
+}
+
+function readStash(sheets: Sheet[]): Stash | null {
+  const sheet = sheets.find((x) => x.name.toLowerCase() === "set aside");
+  if (!sheet) return null;
+  try {
+    const stash = JSON.parse(sheet.rows.slice(1).map((r) => String(r[1] ?? "")).join("")) as Stash;
+    const side = (st: SideState): SideState => ({ ...emptySide(), ...st, error: null });
+    if (stash.kind === "single") {
+      return { kind: "single", single: { ...stash.single, primary: side(stash.single.primary), side: side(stash.single.side) } };
+    }
+    return { ...stash, standard: stash.standard ? side(stash.standard) : null, sources: stash.sources.map((s) => ({ ...s, side: side(s.side) })) };
+  } catch {
+    return null;
+  }
+}
+
+/** Put a set-aside setup back (an import restores what the workbook carried). */
+function applyStash(multi: MultiState, stash: Stash | null): MultiState {
+  if (!stash) return multi;
+  if (stash.kind === "single") return { ...multi, single: stash.single };
+  return {
+    ...multi,
+    sources: stash.sources,
+    activeSource: stash.activeSource || stash.sources[0]?.id || "",
+    standard: stash.standard,
+    standardSide: stash.standardSide,
+    combine: stash.combine ?? multi.combine,
+  };
+}
+
+/** A table / Avro side's text rebuilt with its declared types (from the "Schemas" sheet; older workbooks: "Table definitions"). */
+function withTableDef(side: SideState, sheets: Sheet[], object: string): SideState {
+  if (!["table", "avro", "kafka"].includes(side.format) || side.data === null) return side;
+  const def = (sheets.find((x) => ["schemas", "table definitions"].includes(x.name.toLowerCase()))?.rows.slice(1) ?? [])
+    .filter((r) => String(r[0] ?? "").trim().toLowerCase() === object.toLowerCase())
+    .map((r) => String(r[1] ?? ""))
+    .join("");
+  return def ? { ...side, text: writeFormat(side.format, side.data, side.layout, String(def)) } : side;
 }
 
 /** Per-field questions ("ask" decisions) from an "Unmapped" sheet. */
@@ -433,6 +595,12 @@ function readDecisions(sheets: Sheet[], object: string): FieldDecisions {
 
 /** A scenario's own workbook: multi-source or single pair. */
 function workbookOf(w: Work, docName: string, spec: Spec): Sheet[] {
+  const stash = stashOf(w);
+  const sheets = workbookSheets(w, docName, spec);
+  return stash ? [...sheets, stashSheet(stash)] : sheets;
+}
+
+function workbookSheets(w: Work, docName: string, spec: Spec): Sheet[] {
   const { sides, primary, mappings } = w;
   if (w.multi.enabled) {
     const sources = foldSources(w);
@@ -446,16 +614,28 @@ function workbookOf(w: Work, docName: string, spec: Spec): Sheet[] {
           return same ? mapped[0].fields.join(" + ") : cases.map((c) => `${c.caseName}: ${c.fields.join(" + ") || "—"}`).join("; ");
         }),
       })),
-      results: testRunsOf(w, sources, spec)?.flatMap((r) =>
-        [{ ...r, name: r.name }, ...r.examples.map((ex) => ({ ...ex, name: `${r.name} › ${ex.name}` }))].map((x) =>
-          "error" in x ? { name: x.name, error: x.error } : { name: x.name, caseName: x.caseName, body: x.body },
-        ),
-      ),
-    }), spec, decisionRows("standard", sides[primary].decisions, sides[primary].questions));
+      results: [
+        ...(w.multi.combine === "merge"
+          ? (() => {
+              const merged = mergeOf(w, sources, spec);
+              return merged ? [{ name: "All sources (merged)", caseName: "", body: merged.body }] : [];
+            })()
+          : []),
+        ...(testRunsOf(w, sources, spec)?.flatMap((r) =>
+          [{ ...r, name: r.name }, ...r.examples.map((ex) => ({ ...ex, name: `${r.name} › ${ex.name}` }))].map((x) =>
+            "error" in x ? { name: x.name, error: x.error } : { name: x.name, caseName: x.caseName, body: x.body },
+          ),
+        ) ?? []),
+      ],
+    }), spec, decisionRows("standard", sides[primary].decisions, sides[primary].questions), [
+      ["standard", sides[primary]],
+      ...sources.map((src, i): [string, SideState] => [`S${i + 1}`, src.side]),
+    ]);
   }
   return withSpec(buildWorkbook({
     docName,
     names: { left: sides.left.name ?? "", right: sides.right.name ?? "" },
+    schemaTypes: { left: schemaTypes(sides.left.format, sides.left.text), right: schemaTypes(sides.right.format, sides.right.text) },
     primary,
     data: { left: sides.left.data, right: sides.right.data },
     mappings,
@@ -466,7 +646,10 @@ function workbookOf(w: Work, docName: string, spec: Spec): Sheet[] {
     },
     headers: { left: sides.left.headers ?? {}, right: sides.right.headers ?? {} },
     fixed: { left: sides.left.fixed ?? {}, right: sides.right.fixed ?? {} },
-  }), spec, [...decisionRows("left", sides.left.decisions, sides.left.questions), ...decisionRows("right", sides.right.decisions, sides.right.questions)]);
+  }), spec, [...decisionRows("left", sides.left.decisions, sides.left.questions), ...decisionRows("right", sides.right.decisions, sides.right.questions)], [
+    ["left", sides.left],
+    ["right", sides.right],
+  ]);
 }
 
 /** Which case a message used, for the examples grid. */
@@ -512,7 +695,7 @@ function scenarioFromSheets(sheets: Sheet[], name: string): { sc: ScenarioState;
     const { doc, warnings } = parseMultiWorkbook(sheets);
     if (doc.sources.length === 0) throw new Error(`Scenario "${name}" has no sources.`);
     // The standard is the primary, on the left; sources are on the right.
-    const sources: SourceState[] = doc.sources.map((src) => {
+    const sources: SourceState[] = doc.sources.map((src, si) => {
       const cases: MappingCase[] = src.cases.map((c) => ({
         id: newId(),
         name: c.name,
@@ -531,18 +714,35 @@ function scenarioFromSheets(sheets: Sheet[], name: string): { sc: ScenarioState;
           }),
         ),
       }));
-      return { id: newId(), name: src.name, side: loadedSide(src.side), cases, activeCase: cases[0].id, examples: examplesFromDoc(src.examples) };
+      return {
+        id: newId(),
+        name: src.name,
+        side: withTableDef(loadedSide(src.side), sheets, `S${si + 1}`),
+        cases,
+        activeCase: cases[0].id,
+        examples: examplesFromDoc(src.examples),
+      };
     });
     const first = sources[0];
     return {
       sc: {
         id: newId(),
         name,
-        sides: { left: { ...loadedSide(doc.standard), decisions: readDecisions(sheets, "standard"), questions: readQuestions(sheets, "standard") }, right: first.side },
+        sides: {
+          left: {
+            ...withTableDef(loadedSide(doc.standard), sheets, "standard"),
+            decisions: readDecisions(sheets, "standard"),
+            questions: readQuestions(sheets, "standard"),
+          },
+          right: first.side,
+        },
         primary: "left",
         mappings: first.cases[0].mappings,
         bothEditable: false,
-        multi: { ...emptyMulti(), enabled: true, sources, activeSource: first.id, standardSide: "left" },
+        multi: applyStash(
+          { ...emptyMulti(), enabled: true, sources, activeSource: first.id, standardSide: "left", combine: doc.combine ?? "each" },
+          readStash(sheets),
+        ),
       },
       warnings,
       summary: `${sources.length} source${sources.length === 1 ? "" : "s"}`,
@@ -550,13 +750,13 @@ function scenarioFromSheets(sheets: Sheet[], name: string): { sc: ScenarioState;
   }
   const imported = parseWorkbook(sheets);
   const sideFrom = (side: Side) => ({
-    ...loadedSide({
+    ...withTableDef(loadedSide({
       ...imported.formats[side],
       data: imported.data[side] ?? {},
       headers: imported.headers[side],
       fixed: imported.fixed[side],
       name: imported.names[side],
-    }),
+    }), sheets, side),
     decisions: readDecisions(sheets, side),
     questions: readQuestions(sheets, side),
   });
@@ -569,7 +769,7 @@ function scenarioFromSheets(sheets: Sheet[], name: string): { sc: ScenarioState;
       primary: imported.primary,
       mappings: imported.mappings.map((m) => ({ ...m, id: newId() })),
       bothEditable: false,
-      multi: emptyMulti(),
+      multi: applyStash(emptyMulti(), readStash(sheets)),
     },
     warnings: imported.warnings,
     summary: `${n} mapping${n === 1 ? "" : "s"}`,
@@ -591,6 +791,9 @@ export default function ObjectMapper() {
   const [multi, setMulti] = useState<MultiState>(emptyMulti);
   // The document's main name: the report title and the name of exported files.
   const [docName, setDocName] = useState("");
+  // Which document this is (documents are kept in this browser by id; see lib/documents).
+  const [docId, setDocId] = useState("");
+  const storageWarned = useRef(false);
   // Hand-off details and implementation rules (document-wide, shared by every scenario).
   const [spec, setSpec] = useState<Spec>(DEFAULT_SPEC);
   const [specOpen, setSpecOpen] = useState(false);
@@ -600,6 +803,9 @@ export default function ObjectMapper() {
   // The amber highlight on undecided unmapped fields can be switched off (remembered).
   const [unmappedQuiet, setUnmappedQuiet] = useStoredFlag(UNMAPPED_QUIET_KEY);
   const [helpHidden, setHelpHidden] = useStoredFlag(HELP_HIDDEN_KEY);
+  // Field search, per side.
+  const [search, setSearch] = useState<Record<Side, string>>({ left: "", right: "" });
+  const [canvasView, setCanvasView] = useStoredFlag(CANVAS_VIEW_KEY);
   const [multiCollapsed, setMultiCollapsed] = useStoredFlag(MULTI_COLLAPSED_KEY);
   // Scenarios: the active one is live in the state above; the others are stored here.
   // (Empty until a second scenario is added: the live state is then the only scenario.)
@@ -622,16 +828,47 @@ export default function ObjectMapper() {
   const targetSide: Side = other(sourceSide);
 
   // ---------- persistence ----------
+  /** Put a saved document on screen (missing parts fall back to an empty document). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function applySaved(saved: any) {
+    setSides({
+      left: { ...emptySide(), ...(saved.sides?.left ?? {}), error: null },
+      right: { ...emptySide(), ...(saved.sides?.right ?? {}), error: null },
+    });
+    setPrimary(saved.primary ?? "left");
+    setMappings(saved.mappings ?? []);
+    setBothEditable(saved.bothEditable === true);
+    setMulti({ ...emptyMulti(), ...(saved.multi ?? {}) });
+    setDocName(typeof saved.docName === "string" ? saved.docName : "");
+    setSpec(normalizeSpec(saved.spec));
+    const list = Array.isArray(saved.scenarios) ? (saved.scenarios as ScenarioState[]) : [];
+    setScenarios(
+      list.map((sc) => ({
+        ...sc,
+        sides: {
+          left: { ...emptySide(), ...sc.sides.left, error: null },
+          right: { ...emptySide(), ...sc.sides.right, error: null },
+        },
+        multi: { ...emptyMulti(), ...sc.multi },
+      })),
+    );
+    setActiveScenario(list.length ? (saved.activeScenario ?? list[0].id) : "main");
+    setSelected(null);
+    setNotice(null);
+  }
+
   useEffect(() => {
     try {
       setKnowsClickToMap(localStorage.getItem(HINT_KEY) === "1");
     } catch {
       // storage unavailable; keep showing the hint
     }
+    let id = "";
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
+        id = typeof saved.docId === "string" ? saved.docId : "";
         setSides({
           left: { ...emptySide(), ...saved.sides.left, error: null },
           right: { ...emptySide(), ...saved.sides.right, error: null },
@@ -659,6 +896,7 @@ export default function ObjectMapper() {
     } catch {
       // ignore unreadable saved state
     }
+    setDocId(id || newDocId());
     setLoaded(true);
   }, []);
 
@@ -669,23 +907,189 @@ export default function ObjectMapper() {
     return scenarios.map((sc) => (sc.id === activeScenario ? { ...sc, ...live } : sc));
   }, [scenarios, activeScenario, sides, primary, mappings, bothEditable, multi]);
 
+  /** Everything the app keeps for this document. */
+  const documentState = () => ({
+    docId,
+    sides,
+    primary,
+    mappings,
+    bothEditable,
+    multi,
+    docName,
+    spec,
+    ...(scenarios.length ? { scenarios: allScenarios, activeScenario } : {}),
+  });
+  useEffect(() => {
+    if (!loaded || !docId) return;
+    const json = JSON.stringify(documentState());
+    let ok = true;
+    try {
+      localStorage.setItem(STORAGE_KEY, json);
+    } catch {
+      ok = false;
+    }
+    // Also into the documents list, once there is something worth keeping.
+    const hasContent = sides.left.data !== null || sides.right.data !== null || mappings.length > 0 || multi.enabled || docName.trim() !== "";
+    if (hasContent && !storeDoc(docId, docName, json)) ok = false;
+    if (!ok && !storageWarned.current) {
+      storageWarned.current = true;
+      window.setTimeout(() =>
+        setNotice({
+          kind: "error",
+          text: "This browser's storage is full, so the latest changes aren't kept here. Save to file (☰ Menu → Save to file) or export to Excel so nothing is lost, and delete documents you no longer need.",
+          details: [],
+        }),
+      );
+    }
+    // documentState reads exactly the dependencies below
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sides, primary, mappings, bothEditable, multi, docName, spec, scenarios.length, allScenarios, activeScenario, loaded, docId]);
+
+  // ---------- documents ----------
+  /** Show another document; the one on screen is already kept in the list. */
+  const showDocument = (id: string, saved: Record<string, unknown>) => {
+    applySaved(saved);
+    setDocId(id);
+    history.current = { past: [], future: [], current: null, applying: false, timer: 0 };
+    pending.current = null;
+    setHistorySize({ undo: 0, redo: 0 });
+  };
+  const docActions = {
+    currentDocId: docId,
+    onOpenDoc: (id: string) => {
+      const saved = readDoc(id);
+      if (saved && typeof saved === "object") showDocument(id, saved as Record<string, unknown>);
+    },
+    onNewDoc: () => showDocument(newDocId(), {}),
+    onDeleteDoc: (id: string) => deleteDoc(id),
+    onSaveFile: () => {
+      const url = URL.createObjectURL(new Blob([documentFile(documentState())], { type: "application/json" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${fileSlug(docName)}.mapper.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    onOpenFile: () => docFileRef.current?.click(),
+  };
+  const docFileRef = useRef<HTMLInputElement>(null);
+  const openDocumentFile = async (file: File) => {
+    try {
+      const saved = readDocumentFile(await file.text());
+      // A new id, so opening a file never overwrites a document already in the list.
+      showDocument(newDocId(), saved);
+      setNotice({ kind: "ok", text: `Opened "${file.name}".`, details: [] });
+    } catch (e) {
+      setNotice({ kind: "error", text: `Couldn't open "${file.name}": ${(e as Error).message}`, details: [] });
+    }
+  };
+
+  // ---------- undo / redo: every change to the document, quick bursts (typing) grouped ----------
+  type Snapshot = {
+    sides: typeof sides;
+    primary: Side;
+    mappings: Mapping[];
+    bothEditable: boolean;
+    multi: MultiState;
+    docName: string;
+    spec: Spec;
+    scenarios: ScenarioState[];
+    activeScenario: string;
+  };
+  const history = useRef<{ past: Snapshot[]; future: Snapshot[]; current: Snapshot | null; applying: boolean; timer: number }>({
+    past: [],
+    future: [],
+    current: null,
+    applying: false,
+    timer: 0,
+  });
+  const [historySize, setHistorySize] = useState({ undo: 0, redo: 0 });
+  const commitHistory = (snap: Snapshot) => {
+    const h = history.current;
+    window.clearTimeout(h.timer);
+    h.timer = 0;
+    if (h.current && h.current !== snap) {
+      h.past.push(h.current);
+      if (h.past.length > 100) h.past.shift();
+      h.future = [];
+    }
+    h.current = snap;
+    setHistorySize({ undo: h.past.length, redo: h.future.length });
+  };
+  const pending = useRef<Snapshot | null>(null);
   useEffect(() => {
     if (!loaded) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          sides,
-          primary,
-          mappings,
-          bothEditable,
-          multi,
-          docName,
-          spec,
-          ...(scenarios.length ? { scenarios: allScenarios, activeScenario } : {}),
-        }));
-    } catch {
-      // storage unavailable; the app still works without it
+    const snap: Snapshot = { sides, primary, mappings, bothEditable, multi, docName, spec, scenarios, activeScenario };
+    const h = history.current;
+    if (h.applying || !h.current) {
+      // An undo/redo being applied, or the first state after loading: the new baseline.
+      h.applying = false;
+      h.current = snap;
+      return;
     }
-  }, [sides, primary, mappings, bothEditable, multi, docName, spec, scenarios.length, allScenarios, activeScenario, loaded]);
+    pending.current = snap;
+    window.clearTimeout(h.timer);
+    h.timer = window.setTimeout(() => pending.current && commitHistory(pending.current), 400);
+    // commitHistory only touches refs and state setters
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sides, primary, mappings, bothEditable, multi, docName, spec, scenarios, activeScenario, loaded]);
+
+  const applySnapshot = (snap: Snapshot) => {
+    history.current.applying = true;
+    setSides(snap.sides);
+    setPrimary(snap.primary);
+    setMappings(snap.mappings);
+    setBothEditable(snap.bothEditable);
+    setMulti(snap.multi);
+    setDocName(snap.docName);
+    setSpec(snap.spec);
+    setScenarios(snap.scenarios);
+    setActiveScenario(snap.activeScenario);
+    setSelected(null);
+    setPendingCombine(null);
+    setHover(null);
+  };
+  const undoChange = () => {
+    const h = history.current;
+    if (h.timer && pending.current) commitHistory(pending.current); // finish the step being typed
+    const prev = h.past.pop();
+    if (!prev || !h.current) return;
+    h.future.push(h.current);
+    h.current = prev;
+    applySnapshot(prev);
+    setHistorySize({ undo: h.past.length, redo: h.future.length });
+  };
+  const redoChange = () => {
+    const h = history.current;
+    const next = h.future.pop();
+    if (!next || !h.current) return;
+    h.past.push(h.current);
+    h.current = next;
+    applySnapshot(next);
+    setHistorySize({ undo: h.past.length, redo: h.future.length });
+  };
+  // Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z, Ctrl+Y — but text boxes keep their own undo.
+  const undoRef = useRef({ undo: undoChange, redo: redoChange });
+  useEffect(() => {
+    undoRef.current = { undo: undoChange, redo: redoChange };
+  });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      const key = e.key.toLowerCase();
+      if (key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undoRef.current.undo();
+      } else if ((key === "z" && e.shiftKey) || key === "y") {
+        e.preventDefault();
+        undoRef.current.redo();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // ---------- derived trees ----------
   const trees = useMemo(
@@ -749,7 +1153,7 @@ export default function ObjectMapper() {
         const cur = s[side];
         if (data === null) return { ...s, [side]: { ...cur, data } };
         const layout = cur.format === "flat" ? syncLayoutFields(cur.layout, data) : cur.layout;
-        const text = keepText ? cur.text : writeFormat(cur.format, data, layout);
+        const text = keepText ? cur.text : writeFormat(cur.format, data, layout, cur.text);
         const stillThere = (p: Path) => isHeaderPath(p) || valid.has(pathId(p));
         const fixed = keepFixed(cur.fixed, stillThere, movePath);
         const moreValues = keepFixed(cur.moreValues, stillThere, movePath);
@@ -801,7 +1205,7 @@ export default function ObjectMapper() {
       // Keep the pasted text as-is rather than re-printing it.
       commitData(side, data, undefined, true);
       if (warnings.length) {
-        setNotice({ kind: "ok", text: `Read the ${side} file, but some lines were skipped.`, details: warnings });
+        setNotice({ kind: "ok", text: `Read the ${side} file.`, details: warnings, label: "Please check:" });
       }
     } catch (e) {
       setSides((s) => ({ ...s, [side]: { ...s[side], error: (e as Error).message } }));
@@ -835,7 +1239,7 @@ export default function ObjectMapper() {
     }
     setSides((s) => {
       const cur = s[side];
-      const text = cur.data === null ? cur.text : writeFormat(cur.format, cur.data, layout);
+      const text = cur.data === null ? cur.text : writeFormat(cur.format, cur.data, layout, cur.text);
       return { ...s, [side]: { ...cur, layout, text } };
     });
   };
@@ -1211,14 +1615,17 @@ export default function ObjectMapper() {
   }
 
   /** The error-normalisation example: a standard error and three downstream errors. */
-  const loadMultiExample = () => {
+  /** "error": downstream errors normalised one at a time; "merge": three systems merged into one order summary. */
+  const loadMultiExample = (kind: "error" | "merge" = "error") => {
+    const std = kind === "merge" ? MERGE_STANDARD : STANDARD_ERROR;
     const standard: SideState = {
       ...emptySide(),
-      text: JSON.stringify(STANDARD_ERROR, null, 2),
-      data: STANDARD_ERROR,
+      ...(kind === "merge" ? { name: "Order summary" } : {}),
+      text: JSON.stringify(std, null, 2),
+      data: std,
       editingText: false,
     };
-    const sources: SourceState[] = MULTI_EXAMPLE.map((ex) => {
+    const sources: SourceState[] = (kind === "merge" ? MERGE_EXAMPLE : MULTI_EXAMPLE).map((ex) => {
       const side: SideState = {
         ...emptySide(),
         format: ex.format,
@@ -1251,6 +1658,7 @@ export default function ObjectMapper() {
     setMulti((m) => ({
       ...m,
       enabled: true,
+      combine: kind === "merge" ? "merge" : "each",
       standardSide: primary,
       // Loading the example while multi-source mode is off: keep the single-pair setup to come back to.
       single: m.enabled ? m.single : { primary: sides[primary], side: sides[secondary], mappings },
@@ -1472,7 +1880,7 @@ export default function ObjectMapper() {
   const resultText = useMemo(() => {
     if (result === null) return null;
     const target = sides[targetSide];
-    return writeFormat(target.format, result, target.layout);
+    return writeFormat(target.format, result, target.layout, target.text);
   }, [result, sides, targetSide]);
 
   // Coverage: which source field feeds each standard field, per source (and case).
@@ -1486,6 +1894,76 @@ export default function ObjectMapper() {
     () => testRunsOf({ sides, primary, mappings, multi }, liveSources, spec),
     [sides, primary, mappings, multi, liveSources, spec],
   );
+
+  const merged = useMemo(
+    () => mergeOf({ sides, primary, mappings, multi }, liveSources, spec),
+    [sides, primary, mappings, multi, liveSources, spec],
+  );
+
+  // ---------- canvas view: every object as a card, every mapping as a line ----------
+  const canvas = useMemo(() => {
+    if (!multi.enabled) return null;
+    const std = sides[primary];
+    const cards: CanvasCard[] = [];
+    const links: CanvasLink[] = [];
+    const feeders = new Map<string, string[]>();
+    const caseOf: Record<string, string> = {};
+    liveSources.forEach((src, i) => {
+      const color = CARD_COLORS[i % CARD_COLORS.length];
+      const headers = activeHeaders(src.side);
+      // The case the sample uses when merging; otherwise the case being edited.
+      const kase =
+        (multi.combine === "merge" && src.side.data !== null ? pickCase(src.cases, src.side.data, headers) : null) ??
+        src.cases.find((c) => c.id === src.activeCase) ??
+        src.cases[0];
+      if (kase) caseOf[src.id] = kase.id;
+      const fields = canvasFields(lookupTree(src.side.data, headers));
+      for (const m of kase?.mappings ?? []) {
+        const from = pathId(m[secondary]);
+        const to = pathId(m[primary]);
+        if (isConstPath(m[secondary]) && !fields.some((x) => x.pid === from)) {
+          fields.push({ pid: from, label: "constant", depth: 0, type: "const", value: JSON.stringify(m.constant ?? "") });
+        }
+        links.push({ sourceId: src.id, from, to, color });
+        const list = feeders.get(to) ?? [];
+        if (!list.includes(src.id)) feeders.set(to, [...list, src.id]);
+      }
+      cards.push({
+        id: src.id,
+        title: src.name,
+        subtitle: `${formatInfo(src.side.format).label}${kase && src.cases.length > 1 ? ` · ${kase.name}` : ""}`,
+        kind: "source",
+        color,
+        fields,
+      });
+    });
+    const mergedValue = merged ? (p: Path) => valuesAtPath(merged.body, merged.headers, p)[0] : undefined;
+    cards.push({
+      id: "standard",
+      title: std.name?.trim() || "Standard",
+      subtitle: merged ? "merged result" : formatInfo(std.format).label,
+      kind: "standard",
+      color: "#18181b",
+      fields: canvasFields(lookupTree(std.data, activeHeaders(std)), mergedValue),
+    });
+    // One at a time: each source's own result, shown on the standard when that source is selected.
+    const results: Record<string, { label: string; values: Map<string, string | undefined> }> = {};
+    if (!merged) {
+      const stdTree = lookupTree(std.data, activeHeaders(std));
+      for (const run of testRuns ?? []) {
+        if (run.caseName === undefined || run.body === undefined) {
+          results[run.id] = { label: `${run.name}: ${run.error ?? "no result"}`, values: new Map() };
+          continue;
+        }
+        const fields = canvasFields(stdTree, (p) => valuesAtPath(run.body!, run.headers ?? {}, p)[0]);
+        results[run.id] = {
+          label: `result for ${run.name} · case ${run.caseName}`,
+          values: new Map(fields.map((x) => [x.pid, x.value])),
+        };
+      }
+    }
+    return { cards, links, feeders, results, caseOf };
+  }, [multi.enabled, multi.combine, liveSources, sides, primary, secondary, merged, testRuns]);
 
   // ---------- extra examples of the active source ----------
   const activeRun = testRuns?.find((r) => r.id === multi.activeSource) ?? null;
@@ -1506,13 +1984,16 @@ export default function ObjectMapper() {
         ? []
         : unmappedFields(
             lookups[targetSide],
-            mappings.map((m) => m[targetSide]),
+            // Merged sources: a field filled by any source counts as mapped.
+            multi.enabled && multi.combine === "merge"
+              ? liveSources.flatMap((src) => src.cases.flatMap((c) => c.mappings.map((m) => m[targetSide])))
+              : mappings.map((m) => m[targetSide]),
             sides[targetSide].fixed,
             sides[targetSide].decisions,
             spec,
             sides[targetSide].questions,
           ),
-    [sides, targetSide, sourceSide, lookups, mappings, spec],
+    [sides, targetSide, sourceSide, lookups, mappings, spec, multi.enabled, multi.combine, liveSources],
   );
   const setDecision = (path: Path, decision: FieldDecision | null) =>
     setSides((s) => {
@@ -1561,6 +2042,46 @@ export default function ObjectMapper() {
     setTimeout(() => row.classList.remove("attention-pulse"), 3700);
   };
 
+  // ---------- readiness: is this ready to hand off? ----------
+  const readiness = useMemo(() => {
+    const tree = lookups[targetSide];
+    if (!tree || sides[sourceSide].data === null) return null;
+    const allMappings = multi.enabled ? liveSources.flatMap((src) => src.cases.flatMap((c) => c.mappings)) : mappings;
+    return readinessOf({
+      targetFieldCount: leafPathsOf(tree).filter((p) => !(p.length === 1 && p[0] === HEADERS)).length,
+      unmapped,
+      dbConstants: dbConstantsOf(allMappings, targetSide, [
+        sides[targetSide].fixed,
+        ...(multi.enabled ? liveSources.map((src) => src.side.fixed) : [sides[sourceSide].fixed]),
+      ]),
+      conflicts: merged ? merged.conflicts : undefined,
+      noCase: multi.enabled
+        ? (testRuns ?? []).filter((r) => r.caseName === undefined && /no case/i.test(r.error ?? "")).map((r) => r.name)
+        : undefined,
+      // One source at a time: every source must fill every field (or the field has a decision).
+      coverageGaps:
+        multi.enabled && multi.combine !== "merge" && coverage
+          ? coverage.flatMap((row) =>
+              sides[primary].decisions?.[pathId(row.path)]
+                ? []
+                : row.cells.flatMap((cases, i) =>
+                    cases.every((k) => k.fields.length === 0) ? [`${liveSources[i]?.name}: ${pathLabel(row.path)}`] : [],
+                  ),
+            )
+          : undefined,
+      spec,
+    });
+  }, [lookups, targetSide, sourceSide, sides, multi.enabled, multi.combine, liveSources, mappings, unmapped, merged, testRuns, spec, coverage, primary]);
+  const onReadinessAction = (id: string) => {
+    if (id === "undecided" || id === "questions") {
+      setUnmappedOpen(true);
+      unmappedStep.current = -1;
+      stepUnmapped(1);
+    } else if (id === "spec") setSpecOpen(true);
+    else if (id === "nocase") setMultiCollapsed(false);
+    else if (id === "gaps") setCanvasView(false);
+  };
+
   /** Extra values per field: only on the source in multi-source mode. */
   const moreValueProps = (side: Side) => {
     if (!multi.enabled || side === primary) return {};
@@ -1586,13 +2107,24 @@ export default function ObjectMapper() {
   const setExamples = (sourceId: string, examples: SourceExample[]) =>
     setMulti((m) => ({ ...m, sources: m.sources.map((x) => (x.id === sourceId ? { ...x, examples } : x)) }));
 
-  const downloadResult = () => {
+  /**
+   * Download the mapped result. An Avro result is a schema plus an example message:
+   * "schema" saves a valid .avsc on its own, "example" saves the message as .json.
+   */
+  const downloadResult = (part: "all" | "schema" | "example" = "all") => {
     if (resultText === null) return;
     const info = formatInfo(sides[targetSide].format);
-    const url = URL.createObjectURL(new Blob([resultText], { type: info.mime }));
+    let text = resultText;
+    let ext = info.extension;
+    if (sides[targetSide].format === "avro" && part !== "all") {
+      const pair = JSON.parse(resultText) as { schema: Json; example: Json };
+      text = JSON.stringify(part === "schema" ? pair.schema : pair.example, null, 2);
+      ext = part === "schema" ? "avsc" : "json";
+    }
+    const url = URL.createObjectURL(new Blob([text], { type: info.mime }));
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${fileSlug(docName)}-result.${info.extension}`;
+    a.download = `${fileSlug(docName)}-result${part === "example" ? "-example" : ""}.${ext}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
@@ -1600,12 +2132,24 @@ export default function ObjectMapper() {
   /** One workbook: the scenario on screen, or every scenario when there are several. */
   const exportExcel = () => {
     const file = `${fileSlug(docName)}.xlsx`;
+    /** Download, and say if any cell was longer than Excel allows (it is cut to fit). */
+    const save = (sheets: Sheet[]) => {
+      const tooLong = oversizedCells(sheets);
+      downloadXlsx(file, sheets);
+      if (tooLong.length) {
+        setNotice({
+          kind: "error",
+          text: `Exported "${file}", but ${tooLong.length} cell${tooLong.length === 1 ? " is" : "s are"} longer than Excel allows (32,767 characters) and ${tooLong.length === 1 ? "was" : "were"} cut. Shorten ${tooLong.length === 1 ? "that value" : "those values"} or share the full text another way.`,
+          details: tooLong.map((c) => `${c.sheet} ${c.cell}: ${c.length.toLocaleString()} characters`),
+          label: "Affected cells:",
+        });
+      }
+    };
     if (allScenarios.length < 2) {
-      downloadXlsx(file, workbookOf({ sides, primary, mappings, multi }, docName, spec));
+      save(workbookOf({ sides, primary, mappings, multi }, docName, spec));
       return;
     }
-    downloadXlsx(
-      file,
+    save(
       buildScenariosWorkbook(
         docName,
         allScenarios.map((sc) => ({
@@ -1638,7 +2182,7 @@ export default function ObjectMapper() {
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string; details: string[] } | null>(
+  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string; details: string[]; label?: string } | null>(
     null,
   );
   useEffect(() => {
@@ -1665,7 +2209,7 @@ export default function ObjectMapper() {
       text: writeFormat(d.format, d.data, d.layout),
       editingText: false,
     });
-    const sources: SourceState[] = doc.sources.map((src) => {
+    const sources: SourceState[] = doc.sources.map((src, si) => {
       const cases: MappingCase[] = src.cases.map((c) => ({
         id: newId(),
         name: c.name,
@@ -1683,17 +2227,35 @@ export default function ObjectMapper() {
           }),
         ),
       }));
-      return { id: newId(), name: src.name, side: toSide(src.side), cases, activeCase: cases[0].id, examples: examplesFromDoc(src.examples) };
+      return {
+        id: newId(),
+        name: src.name,
+        side: withTableDef(toSide(src.side), sheets, `S${si + 1}`),
+        cases,
+        activeCase: cases[0].id,
+        examples: examplesFromDoc(src.examples),
+      };
     });
-    setSides((st) => ({ ...st, [primary]: { ...toSide(doc.standard), decisions: readDecisions(sheets, "standard"), questions: readQuestions(sheets, "standard") } }));
+    setSides((st) => ({ ...st, [primary]: {
+      ...withTableDef(toSide(doc.standard), sheets, "standard"),
+      decisions: readDecisions(sheets, "standard"),
+      questions: readQuestions(sheets, "standard"),
+    } }));
     const importedSpec = readSpec(readDocument(sheets).get);
     if (importedSpec) setSpec(importedSpec);
-    setMulti((m) => ({
-      ...m,
-      enabled: true,
-      standardSide: primary,
-      single: m.enabled ? m.single : { primary: sides[primary], side: sides[secondary], mappings },
-    }));
+    const stash = readStash(sheets);
+    setMulti((m) =>
+      applyStash(
+        {
+          ...m,
+          enabled: true,
+          combine: doc.combine ?? "each",
+          standardSide: primary,
+          single: m.enabled ? m.single : { primary: sides[primary], side: sides[secondary], mappings },
+        },
+        stash,
+      ),
+    );
     showSource(sources, sources[0].id);
     if (doc.docName) setDocName(doc.docName);
     const caseCount = sources.reduce((n, x) => n + x.cases.length, 0);
@@ -1724,6 +2286,8 @@ export default function ObjectMapper() {
         const kept = liveSources;
         setMulti((m) => ({ ...m, enabled: false, sources: kept, standard: sides[primary] }));
       }
+      const stash = readStash(sheets);
+      if (stash) setMulti((m) => applyStash({ ...m, enabled: false }, stash));
       if (imported.docName) setDocName(imported.docName);
       const sideFrom = (side: Side): SideState => {
         const { format, layout } = imported.formats[side];
@@ -1744,7 +2308,7 @@ export default function ObjectMapper() {
       };
       const importedSpec = readSpec(readDocument(sheets).get);
       if (importedSpec) setSpec(importedSpec);
-      setSides({ left: sideFrom("left"), right: sideFrom("right") });
+      setSides({ left: withTableDef(sideFrom("left"), sheets, "left"), right: withTableDef(sideFrom("right"), sheets, "right") });
       setPrimary(imported.primary);
       setMappings(imported.mappings.map((m) => ({ ...m, id: newId() })));
       setSelected(null);
@@ -1802,7 +2366,7 @@ export default function ObjectMapper() {
     };
     // panelRefs are stable; re-run when panels mount/unmount
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bump, sides.left.editingText, sides.right.editingText, trees.left === null, trees.right === null]);
+  }, [bump, sides.left.editingText, sides.right.editingText, trees.left === null, trees.right === null, search.left, search.right]);
 
   useLayoutEffect(() => {
     const ws = workspaceRef.current;
@@ -1980,6 +2544,36 @@ export default function ObjectMapper() {
           />
         )}
 
+        {showTree && (
+          <div className="flex items-center gap-2 border-b border-zinc-100 px-3 py-1.5 dark:border-zinc-800">
+            <input
+              value={search[side]}
+              onChange={(e) => setSearch((s) => ({ ...s, [side]: e.target.value }))}
+              onKeyDown={(e) => e.key === "Escape" && setSearch((s) => ({ ...s, [side]: "" }))}
+              placeholder="Search fields…"
+              aria-label={`Search ${side} fields`}
+              className="min-w-0 flex-1 rounded-md border border-zinc-200 bg-transparent px-2 py-0.5 text-xs outline-none focus:border-blue-500 dark:border-zinc-700"
+            />
+            {search[side] && (
+              <>
+                <span className="shrink-0 text-[11px] text-zinc-500">
+                  {(() => {
+                    const q = search[side].trim().toLowerCase();
+                    const n = q && lookups[side] ? leafPathsOf(lookups[side]!).filter((p) => pathLabel(p).toLowerCase().includes(q)).length : 0;
+                    return `${n} match${n === 1 ? "" : "es"}`;
+                  })()}
+                </span>
+                <button
+                  onClick={() => setSearch((s) => ({ ...s, [side]: "" }))}
+                  aria-label="Clear search"
+                  className="shrink-0 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                >
+                  ×
+                </button>
+              </>
+            )}
+          </div>
+        )}
         {showTree ? (
           <div ref={panelRefs[side]} data-drag-scroll className="max-h-[65vh] min-h-64 overflow-auto p-2">
             <div>
@@ -2009,6 +2603,7 @@ export default function ObjectMapper() {
                     onToggleFixed={(path) => toggleFixed(side, path)}
                     onSetFixed={(path, fx) => setFixed(side, path, fx)}
                 {...moreValueProps(side)}
+                visibleIds={visibleForSearch(lookups[side], search[side])}
                   />
                 </div>
               )}
@@ -2029,6 +2624,7 @@ export default function ObjectMapper() {
                 onToggleFixed={(path) => toggleFixed(side, path)}
                 onSetFixed={(path, fx) => setFixed(side, path, fx)}
                 {...moreValueProps(side)}
+                visibleIds={visibleForSearch(lookups[side], search[side])}
                 flagged={side === targetSide ? unmappedFlags : undefined}
                 attention={side === targetSide ? unmappedAttention : undefined}
                 pulse={side === targetSide && unmappedHover}
@@ -2096,8 +2692,29 @@ export default function ObjectMapper() {
               className="rounded-md border border-zinc-200 px-2 py-0.5 text-xs text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
               title="Version, author, purpose and implementation rules (printed on the report)"
             >
-              📋 Spec &amp; rules{spec.version.trim() ? ` · v${spec.version.trim()}` : ""}
+              <Icon name="spec" /> Spec &amp; rules{spec.version.trim() ? ` · v${spec.version.trim()}` : ""}
             </button>
+            {readiness && <ReadinessPanel items={readiness} onAction={onReadinessAction} />}
+            <span className="inline-flex overflow-hidden rounded-md border border-zinc-200 text-xs dark:border-zinc-700">
+              <button
+                onClick={undoChange}
+                disabled={!historySize.undo}
+                title="Undo (Ctrl+Z)"
+                aria-label="Undo"
+                className="px-2 py-0.5 text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                ↶
+              </button>
+              <button
+                onClick={redoChange}
+                disabled={!historySize.redo}
+                title="Redo (Ctrl+Shift+Z)"
+                aria-label="Redo"
+                className="border-l border-zinc-200 px-2 py-0.5 text-zinc-600 hover:bg-zinc-100 disabled:opacity-30 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                ↷
+              </button>
+            </span>
             {allScenarios.length < 2 && (
               <ScenarioBar
                 compact
@@ -2114,9 +2731,9 @@ export default function ObjectMapper() {
               onClick={() => setHelpHidden(false)}
               aria-label="How it works"
               title="How it works"
-              className="flex h-8 w-8 items-center justify-center rounded-full border border-zinc-300 text-sm text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              className="flex h-8 w-8 items-center justify-center rounded-full border border-zinc-300 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
             >
-              ?
+              <Icon name="help" className="h-4 w-4" />
             </button>
           )}
           <AppMenu
@@ -2125,7 +2742,9 @@ export default function ObjectMapper() {
             onSwap={() => setPrimary(secondary)}
             multiMode={multi.enabled}
             onMultiMode={setMultiMode}
-            onLoadMultiExample={loadMultiExample}
+            onLoadMultiExample={() => loadMultiExample("error")}
+            onLoadMergeExample={() => loadMultiExample("merge")}
+            {...docActions}
             onExport={exportExcel}
             exportDisabled={sides.left.data === null && sides.right.data === null}
             onImport={() => fileInputRef.current?.click()}
@@ -2143,18 +2762,42 @@ export default function ObjectMapper() {
               if (file) importExcel(file);
             }}
           />
+          <input
+            ref={docFileRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (file) openDocumentFile(file);
+            }}
+          />
         </div>
       </div>
 
       {!helpHidden && (
         <div className="flex items-start gap-3 rounded-md bg-zinc-100 px-3 py-2 text-sm text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">
-          <p className="flex-1">
-            Click a field on one side, then a field on the other (or drag between them) to map it. Drag fields within the
-            editable side to move them into objects or lists.{" "}
-            {multi.enabled
-              ? "Multi-source mode: each source maps into the 🔒 primary standard object."
-              : "Values flow from the 🔒 primary object into the editable one."}
-          </p>
+          <div className="flex-1">
+            <p className="mb-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+              How it works:{" "}
+              {multi.enabled
+                ? "each source maps into the 🔒 primary standard object."
+                : "values flow from the 🔒 primary object into the editable one."}
+            </p>
+            <ul className="grid gap-x-6 gap-y-0.5 text-xs sm:grid-cols-2">
+              <li><span className="font-medium">Map:</span> click a field on one side, then one on the other (or drag between them).</li>
+              <li><span className="font-medium">Combine:</span> map a second field into the same target to join them.</li>
+              <li><span className="font-medium">Constant:</span> hover a value and click 📌 to fix it.</li>
+              <li><span className="font-medium">Rename / move:</span> double-click a name; drag fields into objects or lists.</li>
+              <li><span className="font-medium">Find:</span> the search box above each object.</li>
+              <li><span className="font-medium">Undo:</span> Ctrl+Z, redo Ctrl+Shift+Z (or ↶ ↷ at the top).</li>
+              <li><span className="font-medium">Unmapped:</span> the ⚠ button on the target lists and decides them.</li>
+              <li><span className="font-medium">Hand-off:</span> check Readiness, set Spec &amp; rules, then ☰ Menu → report or Excel.</li>
+              {multi.enabled && <li><span className="font-medium">Canvas:</span> every source on one board; drag a field onto the standard to map it.</li>}
+              {multi.enabled && <li><span className="font-medium">＋values:</span> hover a source field to add more values it can carry.</li>}
+            </ul>
+          </div>
           <button
             onClick={() => setHelpHidden(true)}
             className="shrink-0 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
@@ -2179,7 +2822,7 @@ export default function ObjectMapper() {
             <p className="flex-1">
               {notice.text}
               {notice.details.length > 0 &&
-                ` ${notice.details.length} row${notice.details.length === 1 ? " was" : "s were"} skipped:`}
+                ` ${notice.label ?? `${notice.details.length} row${notice.details.length === 1 ? " was" : "s were"} skipped:`}`}
             </p>
             <button className="opacity-60 hover:opacity-100" onClick={() => setNotice(null)} aria-label="Dismiss">
               ×
@@ -2217,6 +2860,8 @@ export default function ObjectMapper() {
 
       {multi.enabled && activeSource && (
         <MultiBar
+          combine={multi.combine ?? "each"}
+          onSetCombine={(combine) => setMulti((m) => ({ ...m, combine }))}
           collapsed={multiCollapsed}
           onToggleCollapsed={() => setMultiCollapsed(!multiCollapsed)}
           sources={liveSources}
@@ -2233,6 +2878,79 @@ export default function ObjectMapper() {
         />
       )}
 
+      {multi.enabled && (
+        <div className="-mb-2 flex items-center justify-end gap-2 text-xs text-zinc-500">
+          {canvasView && <span>Every source and the standard on one board.</span>}
+          <span className="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="View">
+            {(
+              [
+                [false, "Panels", "Edit one source at a time beside the standard"],
+                [true, "Canvas", "Every object on a zoomable board with all its mappings"],
+              ] as const
+            ).map(([on, label, title]) => (
+              <button
+                key={label}
+                onClick={() => setCanvasView(on)}
+                aria-pressed={canvasView === on}
+                title={title}
+                className={`px-2.5 py-1 ${
+                  canvasView === on
+                    ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                    : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        </div>
+      )}
+
+      <p className="-mb-2 text-xs text-zinc-500 lg:hidden">
+        On a narrow screen the mapping lines are hidden: fields with the same coloured dot are mapped to each other.
+      </p>
+
+      {multi.enabled && canvasView && canvas ? (
+        <MapCanvas
+          cards={canvas.cards}
+          links={canvas.links}
+          feeders={canvas.feeders}
+          results={canvas.results}
+          onMap={(sourceId, fromPid, toPid) => {
+            // Into the case the card shows; an earlier mapping into the same field (in that case) is replaced.
+            const from = JSON.parse(fromPid) as Path;
+            const to = JSON.parse(toPid) as Path;
+            const caseId = canvas.caseOf[sourceId];
+            const src = liveSources.find((s) => s.id === sourceId);
+            const kase = src?.cases.find((c) => c.id === caseId);
+            if (!src || !kase) return;
+            const m = { id: newId(), ...(primary === "left" ? { left: to, right: from } : { left: from, right: to }) } as Mapping;
+            const replaced = kase.mappings.filter((x) => pathId(x[primary]) === toPid);
+            const edit = (ms: Mapping[]) => [...ms.filter((x) => pathId(x[primary]) !== toPid), m];
+            if (sourceId === multi.activeSource && caseId === src.activeCase) setMappings(edit);
+            else
+              setMulti((mm) => ({
+                ...mm,
+                sources: mm.sources.map((s) =>
+                  s.id !== sourceId ? s : { ...s, cases: s.cases.map((c) => (c.id === caseId ? { ...c, mappings: edit(c.mappings) } : c)) },
+                ),
+              }));
+            setNotice({
+              kind: "ok",
+              text: `Mapped ${src.name} ${pathLabel(from)} → ${pathLabel(to)}${src.cases.length > 1 ? ` (case ${kase.name})` : ""}${
+                replaced.length ? `, replacing ${replaced.map((x) => sourceLabel(x, secondary)).join(" + ")}` : ""
+              }. Ctrl+Z undoes it.`,
+              details: [],
+            });
+          }}
+          positions={multi.canvas ?? {}}
+          onMove={(id, p) => setMulti((m) => ({ ...m, canvas: { ...(m.canvas ?? {}), [id]: p } }))}
+          onOpen={(id) => {
+            showSource(liveSources, id);
+            setCanvasView(false);
+          }}
+        />
+      ) : (
       <div ref={workspaceRef} className="relative grid grid-cols-1 gap-4 lg:grid-cols-[1fr_72px_1fr] lg:gap-0">
         {renderPanel("left")}
         <div className="hidden items-start justify-center pt-3 text-xl text-zinc-400 lg:flex" aria-hidden>
@@ -2292,6 +3010,7 @@ export default function ObjectMapper() {
           })}
         </svg>
       </div>
+      )}
 
       <DragGhost />
 
@@ -2307,15 +3026,24 @@ export default function ObjectMapper() {
         extraTabs={
           multi.enabled
             ? [
+                ...(merged
+                  ? [{ id: "merged", label: "Merged result", content: <MergedPanel merged={merged} /> }]
+                  : []),
                 {
-                  id: "coverage",
-                  label: "Coverage",
-                  content: <CoverageTable rows={coverage} sources={liveSources} standardName={sides[primary].name} />,
-                },
-                {
-                  id: "examples",
-                  label: `Examples${activeSource?.examples?.length ? ` (${activeSource.examples.length})` : ""}`,
-                  content: activeSource ? (
+                  id: "sources",
+                  label: "Sources",
+                  content: (
+                    <SourcesTab
+                      views={[
+                        {
+                          id: "coverage",
+                          label: "Coverage",
+                          content: <CoverageTable rows={coverage} sources={liveSources} standardName={sides[primary].name} merge={multi.combine === "merge"} />,
+                        },
+                        {
+                          id: "examples",
+                          label: `Examples${activeSource?.examples?.length ? ` (${activeSource.examples.length})` : ""}`,
+                          content: activeSource ? (
                     <SourceExamples
                       key={activeSource.id}
                       sourceName={activeSource.name}
@@ -2329,14 +3057,19 @@ export default function ObjectMapper() {
                       newId={newId}
                     />
                   ) : null,
+                        },
+                        { id: "testall", label: "Test all", content: <TestAll runs={testRuns} /> },
+                      ]}
+                    />
+                  ),
                 },
-                { id: "testall", label: "Test all", content: <TestAll runs={testRuns} /> },
               ]
             : []
         }
         resultText={resultText}
         resultFormat={sides[targetSide].format}
-        onDownload={downloadResult}
+        onDownload={() => downloadResult(sides[targetSide].format === "avro" ? "schema" : "all")}
+        onDownloadExample={sides[targetSide].format === "avro" ? () => downloadResult("example") : undefined}
         hoveredIds={hoveredIds}
         onHover={(id) => setHover(id ? { ids: [id], via: "list" } : null)}
         onRemove={(id) => removeMappings([id])}
@@ -2480,17 +3213,24 @@ function CoverageTable({
   rows,
   sources,
   standardName,
+  merge = false,
 }: {
   standardName?: string;
+  /** Merged mode: a field only needs one source, so a row is a gap only when no source feeds it. */
+  merge?: boolean;
   rows: { path: Path; cells: { caseName: string; fields: string[] }[][] }[] | null;
   sources: { id: string; name: string }[];
 }) {
   if (!rows) return <p className="text-sm text-zinc-500">Load a standard object to see coverage.</p>;
-  const gaps = rows.reduce((n, r) => n + r.cells.filter((c) => c.every((k) => k.fields.length === 0)).length, 0);
+  const empty = (cases: { fields: string[] }[]) => cases.every((k) => k.fields.length === 0);
+  const fedBySome = (r: { cells: { fields: string[] }[][] }) => r.cells.some((c) => !empty(c));
+  const gaps = merge
+    ? rows.filter((r) => !fedBySome(r)).length
+    : rows.reduce((n, r) => n + r.cells.filter(empty).length, 0);
   return (
     <div className="overflow-auto">
       <p className="mb-2 text-xs text-zinc-500">
-        Which source field feeds each standard field.{" "}
+        Which source field feeds each standard field.{merge ? " Sources are merged, so a field only needs one of them." : ""}{" "}
         {gaps ? (
           <span className="text-amber-700 dark:text-amber-400">{gaps} gap{gaps === 1 ? "" : "s"} (—).</span>
         ) : (
@@ -2516,6 +3256,13 @@ function CoverageTable({
               <td className="sticky left-0 bg-white py-1 pr-3 dark:bg-zinc-900">{pathLabel(r.path)}</td>
               {r.cells.map((cases, i) => {
                 const mapped = cases.filter((c) => c.fields.length > 0);
+                if (mapped.length === 0 && merge && fedBySome(r)) {
+                  return (
+                    <td key={i} className="py-1 pr-3 text-zinc-400">
+                      —
+                    </td>
+                  );
+                }
                 if (mapped.length === 0) {
                   return (
                     <td key={i} className="bg-amber-50 py-1 pr-3 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400">
@@ -2545,6 +3292,80 @@ function CoverageTable({
 }
 
 /** Every source's sample run through the case that matches it, side by side. */
+/** Coverage, examples and "test all" in one tab, with a switch between them. */
+function SourcesTab({ views }: { views: { id: string; label: string; content: React.ReactNode }[] }) {
+  const [view, setView] = useState(views[0].id);
+  const current = views.find((v) => v.id === view) ?? views[0];
+  return (
+    <div className="flex flex-col gap-3">
+      <span className="inline-flex self-start overflow-hidden rounded-md border border-zinc-300 text-xs dark:border-zinc-700" role="group" aria-label="Source view">
+        {views.map((v) => (
+          <button
+            key={v.id}
+            onClick={() => setView(v.id)}
+            aria-pressed={v.id === current.id}
+            className={`px-2.5 py-1 ${
+              v.id === current.id
+                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            }`}
+          >
+            {v.label}
+          </button>
+        ))}
+      </span>
+      {current.content}
+    </div>
+  );
+}
+
+/** Merged mode: the combined object, which case each source used, and which source fed each field. */
+function MergedPanel({ merged }: { merged: MergeResult }) {
+  const conflict = new Map(merged.conflicts.map((c) => [c.field, c]));
+  return (
+    <div className="grid gap-3 lg:grid-cols-[1fr_minmax(16rem,22rem)]">
+      <div className="min-w-0">
+        <p className="mb-1 text-xs text-zinc-500">
+          Every source fills this one object, in source order; a later source only overwrites a field it has a value for.
+        </p>
+        <pre className="max-h-96 overflow-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 font-mono text-[11px] dark:border-zinc-800 dark:bg-zinc-950">
+          {merged.text}
+        </pre>
+      </div>
+      <div className="flex flex-col gap-3 text-xs">
+        <div>
+          <p className="mb-1 font-medium">Sources used</p>
+          <ul className="flex flex-col gap-0.5">
+            {merged.used.map((u) => (
+              <li key={u.name} className="flex justify-between gap-2">
+                <span className="truncate">{u.name}</span>
+                <span className={u.error ? "text-amber-700 dark:text-amber-400" : "text-zinc-500"}>{u.error ?? `case: ${u.caseName}`}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <p className="mb-1 font-medium">Where each field comes from</p>
+          <ul className="flex flex-col gap-0.5">
+            {merged.feeds.map((f) => (
+              <li key={f.field} className="flex justify-between gap-2">
+                <span className="truncate font-mono">{f.field}</span>
+                <span
+                  className={conflict.has(f.field) ? "text-amber-700 dark:text-amber-400" : "text-zinc-500"}
+                  title={conflict.has(f.field) ? `Several sources have a value; ${conflict.get(f.field)!.winner} (the last) wins` : undefined}
+                >
+                  {f.sources.join(" + ")}
+                  {conflict.has(f.field) && ` ⚠ ${conflict.get(f.field)!.winner} wins`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type TestRun = { id: string; name: string } & ({ error?: string; caseName?: string; text?: string; headers?: Headers | null });
 
 /** One message's result: the case it used and the normalised output. */
@@ -2724,6 +3545,7 @@ function OutputPanel({
   resultText,
   resultFormat,
   onDownload,
+  onDownloadExample,
   hoveredIds,
   onHover,
   onRemove,
@@ -2751,6 +3573,8 @@ function OutputPanel({
   resultText: string | null;
   resultFormat: Format;
   onDownload: () => void;
+  /** An Avro result: download the example message on its own. */
+  onDownloadExample?: () => void;
   hoveredIds: string[] | null;
   onHover: (id: string | null) => void;
   onRemove: (id: string) => void;
@@ -2835,7 +3659,12 @@ function OutputPanel({
         {!collapsed && (
           <div className="ml-auto pb-1">
             {tab === "result" && resultText !== null && (
-              <HeaderButton onClick={onDownload}>⬇ Download .{formatInfo(resultFormat).extension}</HeaderButton>
+              <>
+                <HeaderButton onClick={onDownload}>
+                  {resultFormat === "avro" ? "⬇ Schema .avsc" : `⬇ Download .${formatInfo(resultFormat).extension}`}
+                </HeaderButton>{" "}
+                {onDownloadExample && <HeaderButton onClick={onDownloadExample}>⬇ Example .json</HeaderButton>}
+              </>
             )}{" "}
             {(tab === "flat" || tab === "spec") && (
               <span className="mr-1 inline-flex overflow-hidden rounded-md border border-zinc-300 text-xs dark:border-zinc-700">
@@ -2951,7 +3780,7 @@ function OutputPanel({
                             }`}
                             title="Translate values (e.g. INSUFFICIENT_FUNDS → PAY-001)"
                           >
-                            ⇄ Translate
+                            <Icon name="translate" /> Translate
                           </button>
                         )}
                         <button
@@ -2963,7 +3792,7 @@ function OutputPanel({
                           }`}
                           title="A note for whoever implements this mapping (printed in the report)"
                         >
-                          💬 Note
+                          <Icon name="note" /> Note
                         </button>
                         {group.length > 1 && (
                           <>

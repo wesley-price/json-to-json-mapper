@@ -1,10 +1,10 @@
 // Every scenario in one PDF: a contents page listing the scenarios, then each
 // scenario's own report (single-pair or multi-source) from a new page.
 
-import { buildPdf, pdfText, renderReportPdf } from "./pdf";
+import { buildPdf, needsUnicode, pdfText, renderReportPdf } from "./pdf";
 import { renderMultiReportPdf } from "./pdf-multi";
 import { type ScenarioReport, allTestCases } from "./scenario-model";
-import { drawRulesPage, drawTestCases } from "./pdf-sections";
+import { drawImplementation, drawRulesPage, drawTestCases } from "./pdf-sections";
 
 const MARGIN = 14;
 const CONTENT_W = 210 - MARGIN * 2;
@@ -19,7 +19,7 @@ export async function downloadScenariosPdf(
 ): Promise<void> {
   const title = docName.trim() || "Mapping report";
   const total = scenarios.length;
-  await buildPdf({ title, subject: `${total} mapping scenarios`, footer: title, filename }, async (ctx) => {
+  await buildPdf({ title, subject: `${total} mapping scenarios`, footer: title, filename, unicode: needsUnicode(title, scenarios) }, async (ctx) => {
     const { doc } = ctx;
     const font = (style: "normal" | "bold", size: number, color = "#18181b") => {
       doc.setFont("helvetica", style);
@@ -28,6 +28,7 @@ export async function downloadScenariosPdf(
     };
 
     // ---------- Contents ----------
+    ctx.mark("Scenarios");
     let y = MARGIN;
     font("bold", 8, "#71717a");
     doc.text(`MAPPING REPORT - ${total} SCENARIOS`, MARGIN, y + 1);
@@ -93,17 +94,21 @@ export async function downloadScenariosPdf(
             : (sc.multi?.openQuestions ?? [])
           ).map((q) => ({ ...q, scenario: sc.name })),
         ),
+        () => ctx.mark("Implementation rules"),
       );
 
     // ---------- One section per scenario ----------
     for (const sc of scenarios) {
       doc.addPage();
+      ctx.mark(`Scenario ${sc.n}: ${sc.name}`);
+      // The scenario's own sections sit one level below it in the bookmarks.
+      const inner = { ...ctx, mark: (t: string, level = 0) => ctx.mark(t, level + 1) };
       const kicker = `SCENARIO ${sc.n} OF ${total}${sc.multi ? " - MULTI-SOURCE" : ""}`;
       const scoped = (id: string) => diagram(sc.prefix + id);
       if (sc.multi) {
-        await renderMultiReportPdf(ctx, sc.multi, scoped, { title: sc.name, kicker });
+        await renderMultiReportPdf(inner, sc.multi, scoped, { title: sc.name, kicker });
       } else if (sc.single) {
-        await renderReportPdf(ctx, sc.single, scoped, { title: sc.name, kicker });
+        await renderReportPdf(inner, sc.single, scoped, { title: sc.name, kicker });
       } else {
         font("bold", 8, "#71717a");
         doc.text(kicker, MARGIN, MARGIN + 1);
@@ -113,6 +118,11 @@ export async function downloadScenariosPdf(
         doc.text("Nothing to report yet: this scenario needs both objects.", MARGIN, MARGIN + 20);
       }
     }
-    drawTestCases(doc, allTestCases(scenarios));
+    drawTestCases(doc, allTestCases(scenarios), () => ctx.mark("Test cases"));
+    for (const sc of scenarios) {
+      const m = (sc.single ?? sc.multi) as unknown as { implementation?: { dataPart: string; functions: Record<string, string>; mergeFunction?: string } | null; readiness: { id: string; status: "ok" | "warn" | "info"; title: string; detail: string; items: string[] }[] } | null;
+      if (m?.implementation)
+        drawImplementation(doc, m.implementation, sc.name, m.readiness.find((r) => r.id === "implementation"), () => ctx.mark(`Reference implementation: ${sc.name}`));
+    }
   });
 }

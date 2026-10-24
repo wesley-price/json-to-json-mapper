@@ -12,12 +12,19 @@ import { dateStamp, fileSlug } from "@/lib/names";
 import { MultiReport } from "./MultiReport";
 import { type SavedMulti, buildMultiReport } from "./multi-model";
 import { type ScenarioReport, allTestCases, buildScenarioReports } from "./scenario-model";
-import { RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
+import { ReadinessBlock, RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
+import { implementationItem, readinessCounts } from "@/lib/readiness";
+import { checkImplementation, type Implementation } from "@/lib/codegen";
+import { implementationFor } from "./implementation";
+import { ImplementationSection } from "./SpecSections";
+type WithImpl = { implementation?: Implementation | null; readiness: ReturnType<typeof implementationItem>[] };
+const implCheck = (m: WithImpl) => m.readiness.find((r) => r.id === "implementation");
 import { testCasesFile } from "./test-cases";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { formatInfo } from "@/lib/formats";
-import { pathId } from "@/lib/json-tree";
-import { MappingDiagram, allRows, constantRow, excerptRows, excerptRowsMany } from "./MappingDiagram";
+import { type Path, pathId } from "@/lib/json-tree";
+import { isConstPath } from "@/lib/transforms";
+import { MappingDiagram, constantRow, excerptRows, excerptRowsMany, rowsFor } from "./MappingDiagram";
 import {
   type ReportCombined,
   type ReportMapping,
@@ -94,13 +101,13 @@ function SingleCard({ m, report, prefix }: { m: ReportMapping; report: ReportMod
           <tr className="border-t border-zinc-100">
             <td className="py-1 font-sans text-zinc-500">Source</td>
             <td className="py-1">{m.fromLabel}</td>
-            <td className="py-1">{m.fromType ?? "—"}</td>
+            <td className="py-1">{m.fromSchema ?? m.fromType ?? "—"}</td>
             <td className="py-1 break-all">{showValues(m.sourceValues)}</td>
           </tr>
           <tr className="border-t border-zinc-100">
             <td className="py-1 font-sans text-zinc-500">Target</td>
             <td className="py-1">{m.toLabel}</td>
-            <td className="py-1">{m.toType ?? "—"}</td>
+            <td className="py-1">{m.toSchema ?? m.toType ?? "—"}</td>
             <td className="py-1 break-all">{showValues(m.written)}</td>
           </tr>
         </tbody>
@@ -151,7 +158,7 @@ function CombinedCard({ c, report, prefix }: { c: ReportCombined; report: Report
                 {i + 1}
               </td>
               <td className="py-1">{p.fromLabel}</td>
-              <td className="py-1">{p.fromType ?? "—"}</td>
+              <td className="py-1">{p.fromSchema ?? p.fromType ?? "—"}</td>
               <td className="py-1 break-all">{showValues(p.sourceValues)}</td>
             </tr>
           ))}
@@ -179,9 +186,30 @@ export function MappingReport() {
       const saved = JSON.parse(raw) as Saved & SavedMulti & Parameters<typeof buildScenarioReports>[0];
       const name = (saved.docName ?? "").trim();
       const scenarios = buildScenarioReports(saved);
-      if (scenarios) return { ...none, scenarios, docName: name };
-      if (saved.multi?.enabled) return { ...none, multiReport: buildMultiReport(saved), docName: name };
-      return { ...none, report: buildReport(saved), docName: name };
+      // The reference implementation, checked against the test cases (added to the readiness list).
+      const withImpl = <M extends { readiness: ReturnType<typeof implementationItem>[]; testCases: Parameters<typeof checkImplementation>[1] }>(
+        model: M | null,
+        state: Parameters<typeof implementationFor>[0],
+        title: string,
+      ): (M & { implementation: Implementation | null }) | null => {
+        if (!model) return null;
+        const implementation = implementationFor(state, title);
+        if (!implementation) return { ...model, implementation: null };
+        return { ...model, implementation, readiness: [...model.readiness, implementationItem(checkImplementation(implementation, model.testCases))] };
+      };
+      if (scenarios) {
+        const list = (saved as unknown as { scenarios: Parameters<typeof implementationFor>[0][] }).scenarios;
+        return {
+          ...none,
+          scenarios: scenarios.map((sc, i) => {
+            const state = { ...list[i], spec: saved.spec };
+            return { ...sc, single: withImpl(sc.single, state, sc.name), multi: withImpl(sc.multi, state, sc.name) };
+          }),
+          docName: name,
+        };
+      }
+      if (saved.multi?.enabled) return { ...none, multiReport: withImpl(buildMultiReport(saved), saved, name || "Mapping"), docName: name };
+      return { ...none, report: withImpl(buildReport(saved), saved, name || "Mapping"), docName: name };
     } catch {
       return none;
     }
@@ -261,6 +289,33 @@ export function MappingReport() {
         </Link>
         {pdfState.error && <span className="text-sm text-red-600">{pdfState.error}</span>}
         <div className="ml-auto flex gap-2">
+          <details
+            className="relative"
+            onToggle={(e) => {
+              // Read the section headings when the menu opens.
+              const el = e.currentTarget;
+              if (!el.open) return;
+              const list = el.querySelector("ul");
+              if (!list || !rootRef.current) return;
+              list.innerHTML = "";
+              rootRef.current.querySelectorAll("h1, h2").forEach((h, i) => {
+                if (!h.id) h.id = `section-${i}`;
+                const li = document.createElement("li");
+                const a = document.createElement("a");
+                a.href = `#${h.id}`;
+                a.textContent = h.textContent ?? "";
+                a.className = h.tagName === "H1" ? "block px-3 py-1 font-semibold hover:bg-zinc-100" : "block py-1 pl-6 pr-3 hover:bg-zinc-100";
+                a.onclick = () => (el.open = false);
+                li.appendChild(a);
+                list.appendChild(li);
+              });
+            }}
+          >
+            <summary className="cursor-pointer list-none rounded-md border border-zinc-300 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100">
+              Contents ▾
+            </summary>
+            <ul className="absolute right-0 z-20 mt-1 max-h-[60vh] w-72 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg" />
+          </details>
           <button
             onClick={downloadTestCases}
             className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100"
@@ -291,6 +346,9 @@ export function MappingReport() {
       <div ref={rootRef} className="report mx-auto max-w-[210mm] bg-white px-10 py-8 text-zinc-900 print:max-w-none print:p-0">
         {toolbar}
         <MultiReport report={multiReport} docName={docName} />
+        {(multiReport as WithImpl).implementation && (
+          <ImplementationSection impl={(multiReport as WithImpl).implementation!} name={docName} check={implCheck(multiReport as WithImpl)} />
+        )}
       </div>
     );
   }
@@ -336,6 +394,7 @@ function ScenariosReport({ scenarios, docName, generated }: { scenarios: Scenari
               <th className="py-1 font-normal">Kind</th>
               <th className="py-1 font-normal">Objects</th>
               <th className="py-1 font-normal">Mappings</th>
+              <th className="py-1 font-normal">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -345,7 +404,13 @@ function ScenariosReport({ scenarios, docName, generated }: { scenarios: Scenari
                 <td className="py-1 pr-2 font-medium">{sc.name}</td>
                 <td className="py-1 pr-2">{sc.multi ? "Multi-source" : "Single pair"}</td>
                 <td className="py-1 pr-2">{sc.objects.replace("->", "→").replace("<-", "←")}</td>
-                <td className="py-1">{sc.counts.replace(/ - /g, " · ")}</td>
+                <td className="py-1 pr-2">{sc.counts.replace(/ - /g, " · ")}</td>
+                <td className="py-1">
+                  {(() => {
+                    const w = readinessCounts((sc.single ?? sc.multi)?.readiness ?? []).warnings;
+                    return w ? <span className="text-amber-700">⚠ {w} to check</span> : <span className="text-emerald-700">✓ ready</span>;
+                  })()}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -383,6 +448,10 @@ function ScenariosReport({ scenarios, docName, generated }: { scenarios: Scenari
         );
       })}
       <TestCasesSection cases={allTestCases(scenarios)} />
+      {scenarios.map((sc) => {
+        const m = (sc.single ?? sc.multi) as WithImpl | null;
+        return m?.implementation ? <ImplementationSection key={sc.n} impl={m.implementation} name={sc.name} check={implCheck(m)} /> : null;
+      })}
     </>
   );
 }
@@ -405,6 +474,10 @@ function SingleReport({
   sections?: boolean;
 }) {
   const { src, dst, singles, combined, entries } = report;
+  // Big objects: the overview shows only mapped fields.
+  const linked = report.links.map((l) => ({ from: JSON.parse(l.from) as Path, to: JSON.parse(l.to) as Path }));
+  const srcRows = rowsFor(src.tree, linked.map((l) => l.from).filter((p) => !isConstPath(p)));
+  const dstRows = rowsFor(dst.tree, linked.map((l) => l.to));
   return (
     <>
       {/* 1. Overview */}
@@ -435,24 +508,31 @@ function SingleReport({
             {report.mappedLeafCount} of {report.targetLeafCount}
           </dd>
         </dl>
+        <ReadinessBlock items={report.readiness} />
 
         <h2 className="mt-6 mb-2 text-base font-semibold">Overview</h2>
         <MappingDiagram
           diagramId={prefix + "overview"}
           source={[
-            ...allRows(src.tree),
+            ...srcRows.rows,
             // Constants have no source field; list them after the source tree so their lines have a start.
             ...report.entries
               .flatMap((e) => (e.kind === "single" ? [e.item] : e.item.parts))
               .filter((p) => p.constant !== undefined)
               .map((p) => constantRow(p.from, p.constant, p.db)),
           ]}
-          target={allRows(dst.tree)}
+          target={dstRows.rows}
           links={report.links}
           sourceTitle={report.sourceTitle}
           targetTitle={report.targetTitle}
           maxHeight="200mm"
         />
+        {(srcRows.hidden > 0 || dstRows.hidden > 0) && (
+          <p className="mt-1 text-xs text-zinc-500">
+            Large objects: only mapped fields are drawn ({srcRows.hidden + dstRows.hidden} other fields not shown; every field is
+            listed in the Excel workbook).
+          </p>
+        )}
       </section>
 
       {sections && (
@@ -572,6 +652,9 @@ function SingleReport({
         </pre>
       </section>
       {sections && <TestCasesSection cases={report.testCases} />}
+      {sections && (report as WithImpl).implementation && (
+        <ImplementationSection impl={(report as WithImpl).implementation!} name={docName} check={implCheck(report as WithImpl)} />
+      )}
     </>
   );
 }

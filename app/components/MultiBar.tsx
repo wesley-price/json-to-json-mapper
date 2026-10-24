@@ -5,6 +5,7 @@
 // whose conditions all hold is used.
 
 import { useEffect, useRef, useState } from "react";
+import { Icon } from "./Icon";
 import { type Path, pathId } from "@/lib/json-tree";
 import { CONDITION_OPS, type Condition, type ConditionOp, type MappingCase, describeConditions } from "@/lib/multi";
 
@@ -38,6 +39,9 @@ interface Props {
   /** Does a case's conditions hold for the active source's sample? (null when there's no sample) */
   matchesSample: (c: MappingCase) => boolean | null;
   label: (p: Path) => string;
+  /** "each": every source maps into the standard on its own; "merge": all sources fill one object together. */
+  combine: "each" | "merge";
+  onSetCombine: (mode: "each" | "merge") => void;
   /** Show only a one-line summary (the active source and case). */
   collapsed: boolean;
   onToggleCollapsed: () => void;
@@ -67,7 +71,9 @@ export function MultiBar(props: Props) {
       <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-1.5 text-xs shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
         {toggle}
         <button onClick={props.onToggleCollapsed} className="flex min-w-0 flex-1 items-center gap-2 text-left" title="Show sources and cases">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Sources &amp; cases</span>
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            Sources &amp; cases{props.combine === "merge" ? " · merged" : ""}
+          </span>
           <span className="truncate text-zinc-700 dark:text-zinc-300">
             <span className="font-medium">{active?.name}</span>
             {props.sources.length > 1 && <span className="text-zinc-400"> (1 of {props.sources.length})</span>}
@@ -102,6 +108,32 @@ export function MultiBar(props: Props) {
           />
         ))}
         <AddSource options={props.addSourceFrom} onAdd={props.onAddSource} />
+        <span
+          className="ml-auto inline-flex overflow-hidden rounded-md border border-zinc-300 text-xs dark:border-zinc-700"
+          role="group"
+          aria-label="How sources combine"
+        >
+          {(
+            [
+              ["each", "One at a time", "Each source maps into the standard on its own (e.g. different downstream errors)"],
+              ["merge", "Merged into one", "All sources fill the same object together (e.g. customer + order + payment into one document)"],
+            ] as const
+          ).map(([id, label, title]) => (
+            <button
+              key={id}
+              onClick={() => props.onSetCombine(id)}
+              aria-pressed={props.combine === id}
+              title={title}
+              className={`px-2 py-1 ${
+                props.combine === id
+                  ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                  : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </span>
       </div>
 
       {/* Cases of the active source */}
@@ -172,7 +204,7 @@ export function MultiBar(props: Props) {
                     className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                     title="A note for whoever implements this case (printed in the report)"
                   >
-                    💬 Note
+                    <Icon name="note" /> Note
                   </button>
                 ) : null
               }
@@ -180,7 +212,7 @@ export function MultiBar(props: Props) {
           )}
           {activeCase && (activeCase.note || noteOpen) && (
             <label className="flex items-start gap-2 text-xs">
-              <span className="mt-1 shrink-0 text-zinc-500">💬 Note</span>
+              <span className="mt-1 shrink-0 text-zinc-500"><Icon name="note" /> Note</span>
               <textarea
                 key={activeCase.id}
                 autoFocus={noteOpen && !activeCase.note}

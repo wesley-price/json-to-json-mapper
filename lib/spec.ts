@@ -27,7 +27,29 @@ export interface Spec {
   headersCaseInsensitive: boolean;
   /** Anything else the implementer should know. */
   notes: string;
+  // ---------- streaming (Kafka) ----------
+  /** Topics the sources are read from. */
+  inputTopics: string;
+  /** Topic the result is written to. */
+  outputTopic: string;
+  /** Which output field becomes the message key (drives partitioning and compaction). */
+  messageKey: string;
+  /** Merged sources: the field events are joined on, and the time window. */
+  joinKey: string;
+  joinWindow: string;
+  /** Where messages go that no case handles or that fail to map. */
+  deadLetterTopic: string;
+  /** What happens to deletes (tombstones, CDC op = "d"). */
+  deletes: DeletePolicy;
 }
+
+export type DeletePolicy = "" | "drop" | "tombstone" | "map";
+export const DELETE_OPTIONS: { id: DeletePolicy; label: string; rule: string }[] = [
+  { id: "", label: "Not specified", rule: "" },
+  { id: "drop", label: "Drop them (no output)", rule: "Deletes (tombstones, or CDC events with op = d) produce no output." },
+  { id: "tombstone", label: "Forward a tombstone (same key, null value)", rule: "A delete is forwarded as a tombstone: the same message key with a null value." },
+  { id: "map", label: "Map them like other events", rule: "Deletes are mapped like any other event (use a case on op, or on the null value)." },
+];
 
 export const DEFAULT_SPEC: Spec = {
   version: "",
@@ -38,6 +60,13 @@ export const DEFAULT_SPEC: Spec = {
   coerce: "as-is",
   headersCaseInsensitive: true,
   notes: "",
+  inputTopics: "",
+  outputTopic: "",
+  messageKey: "",
+  joinKey: "",
+  joinWindow: "",
+  deadLetterTopic: "",
+  deletes: "",
 };
 
 /** A decision for one unmapped target field (overrides the document rule). */
@@ -116,7 +145,36 @@ export function describeRules(spec: Spec): { title: string; text: string }[] {
       title: "Lists",
       text: "A mapping from a list into a list writes one target item per source item. A list feeding a single field uses the last item's value.",
     },
+    ...streamRules(spec),
   ];
+}
+
+/** Streaming (Kafka) rules, when any are set. */
+export function streamRules(spec: Spec): { title: string; text: string }[] {
+  const out: { title: string; text: string }[] = [];
+  const topics = [
+    spec.inputTopics.trim() && `read from ${spec.inputTopics.trim()}`,
+    spec.outputTopic.trim() && `written to ${spec.outputTopic.trim()}`,
+  ].filter(Boolean);
+  if (topics.length) out.push({ title: "Topics", text: `Events are ${topics.join(" and ")}.` });
+  if (spec.messageKey.trim())
+    out.push({
+      title: "Message key",
+      text: `The output message key is ${spec.messageKey.trim()}. It decides the partition (so events for the same key stay in order) and what log compaction keeps.`,
+    });
+  if (spec.joinKey.trim() || spec.joinWindow.trim())
+    out.push({
+      title: "Joining sources",
+      text: `Merged sources are joined on ${spec.joinKey.trim() || "(join key not set)"}${spec.joinWindow.trim() ? ` within ${spec.joinWindow.trim()}` : ""}. Events that find no partner in that window are handled as if that source were missing.`,
+    });
+  if (spec.deadLetterTopic.trim())
+    out.push({
+      title: "Dead letters",
+      text: `Events no case matches, or that fail to map, go to ${spec.deadLetterTopic.trim()} unchanged, with the error in a header.`,
+    });
+  const del = DELETE_OPTIONS.find((o) => o.id === spec.deletes);
+  if (del?.rule) out.push({ title: "Deletes and tombstones", text: del.rule });
+  return out;
 }
 
 // ---------- applying the rules to a result ----------
@@ -145,6 +203,9 @@ function editAt(root: Json, path: Path, fn: Edit): Json {
   if (!(head in root)) return root;
   return { ...root, [head]: editAt(root[head], rest, fn) };
 }
+
+/** The fields the rules apply to (leaf values; empty objects/lists excluded), with their types. */
+export const ruleLeaves = (node: FieldNode) => leaves(node);
 
 function leaves(node: FieldNode, out: { path: Path; type: string }[] = []) {
   for (const c of node.children) {
@@ -204,7 +265,8 @@ export function applyRules(
   out: { body: Json; headers: Headers },
   ctx: {
     targetTree: FieldNode | null;
-    mappings: { from: Path; to: Path }[];
+    /** Each mapping can name its own source message (when several sources are merged). */
+    mappings: { from: Path; to: Path; source?: { body: Json; headers: Headers | undefined; fixed?: FixedValues } }[];
     source: { body: Json; headers: Headers | undefined };
     sourceFixed?: FixedValues;
     targetFixed?: FixedValues;
@@ -234,9 +296,11 @@ export function applyRules(
     }
     // Missing: every mapping into this field reads a source field that isn't there.
     const missing = into.every((m) => {
-      if (isConstPath(m.from) || pathId(m.from) in (ctx.sourceFixed ?? {})) return false;
+      const src = m.source ?? source;
+      const fixed = m.source ? m.source.fixed : ctx.sourceFixed;
+      if (isConstPath(m.from) || pathId(m.from) in (fixed ?? {})) return false;
       const from = [...m.from, ...path.slice(m.to.length)];
-      return valuesAtPath(source.body, source.headers, from).length === 0;
+      return valuesAtPath(src.body, src.headers, from).length === 0;
     });
     if (missing) {
       const fn = valueFor(spec.missing);
@@ -259,6 +323,13 @@ const ROWS: [keyof Spec, string][] = [
   ["coerce", "Rule: value types"],
   ["headersCaseInsensitive", "Rule: header names ignore case"],
   ["notes", "Notes for the implementer"],
+  ["inputTopics", "Stream: input topics"],
+  ["outputTopic", "Stream: output topic"],
+  ["messageKey", "Stream: message key"],
+  ["joinKey", "Stream: join key"],
+  ["joinWindow", "Stream: join window"],
+  ["deadLetterTopic", "Stream: dead-letter topic"],
+  ["deletes", "Stream: deletes"],
 ];
 
 /** Property | Value rows for the Document sheet. */
@@ -283,6 +354,13 @@ export function readSpec(get: (key: string) => string): Spec | null {
     coerce: pick(raw.coerce, COERCE_OPTIONS.map((o) => o.id), DEFAULT_SPEC.coerce),
     headersCaseInsensitive: raw.headersCaseInsensitive ? !/^(no|false|0)$/i.test(raw.headersCaseInsensitive) : true,
     notes: raw.notes,
+    inputTopics: raw.inputTopics,
+    outputTopic: raw.outputTopic,
+    messageKey: raw.messageKey,
+    joinKey: raw.joinKey,
+    joinWindow: raw.joinWindow,
+    deadLetterTopic: raw.deadLetterTopic,
+    deletes: pick(raw.deletes, DELETE_OPTIONS.map((o) => o.id), DEFAULT_SPEC.deletes),
   };
 }
 

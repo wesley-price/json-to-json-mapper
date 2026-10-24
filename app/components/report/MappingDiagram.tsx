@@ -227,6 +227,17 @@ export function excerptRowsMany(root: FieldNode, paths: Path[]): DiagramRow[] {
 }
 
 /** A source row standing for a constant value (constants have no field in the source tree). */
+/** Above this many rows, a diagram shows only the mapped fields (and their parents). */
+export const DIAGRAM_ROW_LIMIT = 45;
+
+/** Every row, or for a big object only the fields in `keep` (with their parents); `hidden` counts the rest. */
+export function rowsFor(root: FieldNode, keep: Path[]): { rows: DiagramRow[]; hidden: number } {
+  const all = allRows(root);
+  if (all.length <= DIAGRAM_ROW_LIMIT) return { rows: all, hidden: 0 };
+  const rows = excerptRowsMany(root, keep);
+  return { rows, hidden: all.length - rows.length };
+}
+
 export function constantRow(path: Path, value: unknown, db?: { table: string; column: string }): DiagramRow {
   return {
     id: pathId(path),

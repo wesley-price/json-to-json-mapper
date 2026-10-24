@@ -4,7 +4,7 @@
 
 import { formatInfo } from "@/lib/formats";
 import type { MultiReportModel } from "./multi-model";
-import { type PdfCtx, buildPdf, pdfReadySvg, pdfText, svgHeight } from "./pdf";
+import { type PdfCtx, buildPdf, needsUnicode, pdfReadySvg, pdfText, svgHeight } from "./pdf";
 import type { Spec } from "@/lib/spec";
 import type { TestCase } from "./test-cases";
 
@@ -19,7 +19,7 @@ export async function downloadMultiReportPdf(
   filename: string,
 ): Promise<void> {
   const title = model.docName || "Mapping report";
-  await buildPdf({ title, subject: "Multi-source mapping report", footer: title, filename }, (ctx) =>
+  await buildPdf({ title, subject: "Multi-source mapping report", footer: title, filename, unicode: needsUnicode(title, model) }, (ctx) =>
     renderMultiReportPdf(ctx, model, diagram, {
       title,
       kicker: "MULTI-SOURCE MAPPING REPORT",
@@ -31,7 +31,7 @@ export async function downloadMultiReportPdf(
 
 /** Draw the multi-source report into `ctx.doc`, starting at the top of its current (empty) page. */
 export async function renderMultiReportPdf(
-  { doc, svg2pdf, host }: PdfCtx,
+  { doc, svg2pdf, host, mark }: PdfCtx,
   model: MultiReportModel,
   diagram: (id: string) => SVGSVGElement | null,
   opts: {
@@ -127,6 +127,7 @@ export async function renderMultiReportPdf(
 
   {
     // ---------- Title, summary, coverage ----------
+    mark(`${title}: summary and coverage`);
     font("helvetica", "bold", 8, "#71717a");
     doc.text(pdfText(kicker), MARGIN, y + 1);
     y += 4;
@@ -156,7 +157,7 @@ export async function renderMultiReportPdf(
       y += 5.2 + (wrapped.length - 1) * 4;
     }
 
-    y += 4;
+    y = (await import("./pdf-sections")).drawReadiness(doc, model.readiness, y + 2);
     font("helvetica", "bold", 12);
     doc.text("Coverage", MARGIN, y);
     y += 4;
@@ -173,11 +174,53 @@ export async function renderMultiReportPdf(
       })),
     );
 
-    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions);
+    // Merged mode: the combined object.
+    if (model.merged) {
+      newPage();
+      mark("Merged result", 1);
+      font("helvetica", "bold", 14);
+      doc.text("Merged result", MARGIN, y + 4);
+      y += 10;
+      font("helvetica", "normal", 8.5, "#71717a");
+      for (const line of lines(`All sources fill this one ${model.standard.name} object together, in source order. A later source only overwrites a field it has a value for.`, CONTENT_W)) {
+        doc.text(line, MARGIN, y);
+        y += LINE;
+      }
+      y += 2;
+      table(
+        [
+          { label: "Source", width: 60 },
+          { label: "Case used", width: CONTENT_W - 60 },
+        ],
+        model.merged.used.map((u) => ({ cells: [u.name, u.error ?? u.caseName ?? ""], shade: [false, !!u.error] })),
+      );
+      y += 4;
+      if (model.merged.conflicts.length) {
+        table(
+          [
+            { label: "Field filled by several sources", width: 70, mono: true },
+            { label: "Sources (last wins)", width: CONTENT_W - 70 },
+          ],
+          model.merged.conflicts.map((c) => ({ cells: [c.field, `${c.sources.join(", ")} -> ${c.winner}`], shade: [false, true] })),
+        );
+        y += 4;
+      }
+      font("courier", "normal", 7, "#27272a");
+      for (const raw of model.merged.text.replace(/\n$/, "").split("\n")) {
+        for (const line of lines(raw || " ", CONTENT_W)) {
+          ensure(3.2);
+          doc.text(line, MARGIN, y);
+          y += 3.1;
+        }
+      }
+    }
+
+    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions, () => mark("Implementation rules", 1));
 
     // ---------- One section per source ----------
     for (const src of model.sources) {
       newPage();
+      mark(`Source ${src.n}: ${src.name}`, 1);
       font("helvetica", "bold", 14);
       doc.text(lines(`Source ${src.n}: ${src.name}`, CONTENT_W - 30)[0], MARGIN, y + 4);
       font("helvetica", "normal", 9, "#71717a");
@@ -308,6 +351,9 @@ export async function renderMultiReportPdf(
         }
       }
     }
-    if (opts.testCases) drawTestCases(doc, opts.testCases);
+    if (opts.testCases) drawTestCases(doc, opts.testCases, () => mark("Test cases", 1));
+    const withImpl = model as unknown as { implementation?: { dataPart: string; functions: Record<string, string>; mergeFunction?: string } | null; readiness: { id: string; status: "ok" | "warn" | "info"; title: string; detail: string; items: string[] }[] };
+    if (opts.testCases && withImpl.implementation)
+      (await import("./pdf-sections")).drawImplementation(doc, withImpl.implementation, "", withImpl.readiness.find((r) => r.id === "implementation"), () => mark("Reference implementation", 1));
   }
 }

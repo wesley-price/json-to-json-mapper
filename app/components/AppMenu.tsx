@@ -9,6 +9,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { FORMATS, type Format } from "@/lib/formats";
 import { ThemeSwitch } from "./ThemeSwitch";
+import { type DocEntry, listDocs } from "@/lib/documents";
 
 interface Props {
   bothEditable: boolean;
@@ -23,7 +24,23 @@ interface Props {
   multiMode: boolean;
   onMultiMode: (on: boolean) => void;
   onLoadMultiExample: () => void;
+  onLoadMergeExample: () => void;
+  /** Documents kept in this browser, and files. */
+  currentDocId: string;
+  onOpenDoc: (id: string) => void;
+  onNewDoc: () => void;
+  onDeleteDoc: (id: string) => void;
+  onSaveFile: () => void;
+  onOpenFile: () => void;
 }
+
+const ago = (iso: string) => {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString();
+};
 
 const CLOSE_DELAY = 250; // ms; lets the pointer cross the gap between button and panel
 
@@ -126,6 +143,12 @@ export function AppMenu(props: Props) {
           aria-label="Menu"
           className="absolute right-0 top-full z-40 mt-1 w-72 overflow-hidden rounded-lg border border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
         >
+          <Group title="Documents">
+            <DocList current={props.currentDocId} onOpen={(id) => act(() => props.onOpenDoc(id))()} onDelete={props.onDeleteDoc} />
+            <Item onClick={act(props.onNewDoc)}>＋ New document</Item>
+            <Item onClick={act(props.onSaveFile)}>⬇ Save to file (.json)</Item>
+            <Item onClick={act(props.onOpenFile)}>⬆ Open file…</Item>
+          </Group>
           <Group title="Workspace">
             {/* The standard must stay the primary in multi-source mode. */}
             {!props.multiMode && <Item onClick={act(props.onSwap)}>⇄ Swap primary side</Item>}
@@ -164,6 +187,15 @@ export function AppMenu(props: Props) {
                   className="mt-0.5 rounded-md bg-zinc-900 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
                 >
                   Load error example
+                </button>
+                <p className="mt-1.5 text-zinc-500">
+                  An order summary filled by three systems at once (a CRM table, an order service, a payments XML).
+                </p>
+                <button
+                  onClick={act(props.onLoadMergeExample)}
+                  className="mt-0.5 rounded-md bg-zinc-900 px-2 py-1 text-xs font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                >
+                  Load merge example
                 </button>
               </div>
             ) : (
@@ -228,6 +260,42 @@ function SwitchRow({
         <span className="absolute left-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform peer-checked:translate-x-3" />
       </span>
     </label>
+  );
+}
+
+/** The documents kept in this browser (read when the menu opens). */
+function DocList({ current, onOpen, onDelete }: { current: string; onOpen: (id: string) => void; onDelete: (id: string) => void }) {
+  const [docs, setDocs] = useState<DocEntry[]>(() => listDocs());
+  if (!docs.length) return <p className="px-2 py-1 text-xs text-zinc-500">Documents you work on are kept here.</p>;
+  return (
+    <ul className="max-h-48 overflow-auto py-0.5">
+      {docs.map((d) => (
+        <li key={d.id} className="group flex items-center gap-1 rounded px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+          <button
+            onClick={() => d.id !== current && onOpen(d.id)}
+            className={`min-w-0 flex-1 truncate text-left text-sm ${d.id === current ? "font-semibold" : ""}`}
+            title={d.id === current ? "The document on screen" : `Open "${d.name}"`}
+          >
+            {d.id === current ? "● " : ""}
+            {d.name}
+          </button>
+          <span className="shrink-0 text-[11px] text-zinc-400">{ago(d.updated)}</span>
+          {d.id !== current && (
+            <button
+              onClick={() => {
+                onDelete(d.id);
+                setDocs(listDocs());
+              }}
+              aria-label={`Delete ${d.name}`}
+              title="Delete from this browser"
+              className="shrink-0 px-1 text-zinc-400 opacity-0 hover:text-red-600 group-hover:opacity-100"
+            >
+              ×
+            </button>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 

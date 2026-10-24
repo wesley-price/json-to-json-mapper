@@ -19,7 +19,7 @@ const CONTENT_W = PAGE_W - MARGIN * 2;
  * the report uses for plain equivalents and replace anything else unsupported.
  */
 export function pdfText(s: string): string {
-  return s
+  const out = s
     .replace(/→/g, "->")
     .replace(/←/g, "<-")
     .replace(/…/g, "...")
@@ -27,8 +27,51 @@ export function pdfText(s: string): string {
     .replace(/·/g, "-")
     .replace(/≥/g, ">=")
     .replace(/≤/g, "<=")
-    .replace(/≠/g, "!=")
-    .replace(/[^\x00-\xff]/g, "?");
+    .replace(/≠/g, "!=");
+  // With the Unicode font embedded, other scripts print as they are.
+  return unicodeFont ? out : out.replace(/[^\x00-\xff]/g, "?");
+}
+
+/** Set while a PDF with the embedded Unicode font is being built. */
+let unicodeFont = false;
+
+/** Does this content have characters the PDF's built-in fonts can't print (e.g. Greek, Cyrillic, Arabic)? */
+export function needsUnicode(...content: unknown[]): boolean {
+  try {
+    return /[^\x00-\xff]/.test(pdfTextPlain(JSON.stringify(content)));
+  } catch {
+    return false;
+  }
+}
+const pdfTextPlain = (s: string) => s.replace(/[→←…—–·≥≤≠]/g, "");
+
+/** Embed DejaVu Sans / Sans Mono (Latin, Greek, Cyrillic, Hebrew, Arabic…) and use them for the built-in font names. */
+async function embedUnicodeFonts(doc: import("jspdf").jsPDF) {
+  const files: [string, string, "normal" | "bold"][] = [
+    ["DejaVuSans.ttf", "DejaVu", "normal"],
+    ["DejaVuSans-Bold.ttf", "DejaVu", "bold"],
+    ["DejaVuSansMono.ttf", "DejaVuMono", "normal"],
+    ["DejaVuSansMono-Bold.ttf", "DejaVuMono", "bold"],
+  ];
+  await Promise.all(
+    files.map(async ([file, family, style]) => {
+      const res = await fetch(`/fonts/dejavu/${file}`);
+      if (!res.ok) throw new Error(`The font ${file} couldn't be loaded.`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      doc.addFileToVFS(file, btoa(binary));
+      doc.addFont(file, family, style);
+    }),
+  );
+  // Everything (the report code and svg2pdf) asks for helvetica / courier: map them to DejaVu.
+  const setFont = doc.setFont.bind(doc);
+  const families: Record<string, string> = { helvetica: "DejaVu", times: "DejaVu", courier: "DejaVuMono" };
+  doc.setFont = ((family: string, style?: string, weight?: string | number) => {
+    const f = families[String(family).toLowerCase()] ?? family;
+    const st = style === "bolditalic" ? "bold" : style === "italic" ? "normal" : style;
+    return setFont(f, st, weight);
+  }) as typeof doc.setFont;
 }
 
 /** A copy of a diagram SVG with PDF-safe fonts and text. */
@@ -54,6 +97,8 @@ export interface PdfCtx {
   doc: import("jspdf").jsPDF;
   svg2pdf: typeof import("svg2pdf.js").svg2pdf;
   host: HTMLElement;
+  /** Record a section starting on the current page (bookmarks and the contents page). */
+  mark: (title: string, level?: number) => void;
 }
 
 /**
@@ -61,18 +106,25 @@ export interface PdfCtx {
  * jsPDF and svg2pdf.js are loaded here, on demand.
  */
 export async function buildPdf(
-  meta: { title: string; subject: string; footer: string; filename: string },
+  meta: { title: string; subject: string; footer: string; filename: string; unicode?: boolean },
   draw: (ctx: PdfCtx) => Promise<void>,
 ): Promise<void> {
   const [{ jsPDF }, { svg2pdf }] = await Promise.all([import("jspdf"), import("svg2pdf.js")]);
   const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
+  if (meta.unicode) {
+    await embedUnicodeFonts(doc);
+    unicodeFont = true;
+  }
   doc.setProperties({ title: pdfText(meta.title), subject: pdfText(meta.subject) });
   // svg2pdf reads the SVG from the document, so converted copies are briefly attached off-screen.
   const host = document.createElement("div");
   host.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;visibility:hidden";
   document.body.appendChild(host);
+  const marks: { title: string; level: number; page: number }[] = [];
+  const mark = (title: string, level = 0) => marks.push({ title, level, page: doc.getCurrentPageInfo().pageNumber });
   try {
-    await draw({ doc, svg2pdf, host });
+    await draw({ doc, svg2pdf, host, mark });
+    if (marks.length >= 3) addContents(doc, marks);
     const pages = doc.getNumberOfPages();
     for (let i = 1; i <= pages; i++) {
       doc.setPage(i);
@@ -84,6 +136,45 @@ export async function buildPdf(
     doc.save(meta.filename);
   } finally {
     host.remove();
+    unicodeFont = false;
+  }
+}
+
+/** A contents page after the cover, plus PDF bookmarks for every section. */
+function addContents(doc: import("jspdf").jsPDF, marks: { title: string; level: number; page: number }[]) {
+  doc.insertPage(2);
+  const shifted = marks.map((m) => ({ ...m, page: m.page >= 2 ? m.page + 1 : m.page }));
+  // One page of contents: deeper levels are dropped first if there are too many.
+  const ROW = 5.4;
+  const room = Math.floor((PAGE_H - MARGIN * 2 - 24) / ROW);
+  const shown = shifted.length <= room ? shifted : shifted.filter((m) => m.level === 0).slice(0, room);
+  doc.setPage(2);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(15);
+  doc.setTextColor("#18181b");
+  doc.text("Contents", MARGIN, MARGIN + 4);
+  let y = MARGIN + 16;
+  for (const m of shown) {
+    const x = MARGIN + m.level * 6;
+    doc.setFont("helvetica", m.level === 0 ? "bold" : "normal");
+    doc.setFontSize(m.level === 0 ? 10 : 9);
+    doc.setTextColor(m.level === 0 ? "#18181b" : "#3f3f46");
+    const title = pdfText(m.title);
+    doc.text(title, x, y);
+    doc.text(String(m.page), PAGE_W - MARGIN, y, { align: "right" });
+    // Dotted leader between the title and the page number.
+    const from = x + doc.getTextWidth(title) + 2;
+    const to = PAGE_W - MARGIN - doc.getTextWidth(String(m.page)) - 2;
+    doc.setTextColor("#d4d4d8");
+    for (let dx = from; dx < to; dx += 1.6) doc.text(".", dx, y);
+    doc.link(MARGIN, y - 3.8, CONTENT_W, ROW, { pageNumber: m.page });
+    y += ROW;
+  }
+  // Bookmarks (the PDF viewer's outline).
+  let parent: unknown = null;
+  for (const m of shifted) {
+    const node = doc.outline.add(m.level === 0 ? null : (parent as never), pdfText(m.title), { pageNumber: m.page });
+    if (m.level === 0) parent = node;
   }
 }
 
@@ -97,7 +188,7 @@ export async function downloadReportPdf(
 ): Promise<void> {
   const title = docName.trim() || "Mapping report";
   await buildPdf(
-    { title, subject: `${model.sourceTitle} to ${model.targetTitle}`, footer: title, filename },
+    { title, subject: `${model.sourceTitle} to ${model.targetTitle}`, footer: title, filename, unicode: needsUnicode(title, model) },
     (ctx) =>
       renderReportPdf(ctx, model, diagram, {
         title,
@@ -114,7 +205,7 @@ export async function downloadReportPdf(
 
 /** Draw the single-pair report into `ctx.doc`, starting at the top of its current (empty) page. */
 export async function renderReportPdf(
-  { doc, svg2pdf, host }: PdfCtx,
+  { doc, svg2pdf, host, mark }: PdfCtx,
   model: ReportModel,
   diagram: (id: string) => SVGSVGElement | null,
   /** The heading, the small capitals line above it, and the shared rules / test-case pages to include. */
@@ -168,6 +259,7 @@ export async function renderReportPdf(
 
   {
     // ---------- Page 1: summary + overview ----------
+    mark(`${opts.title}: summary and overview`);
     if (kicker) {
       font("helvetica", "bold", 8, "#71717a");
       doc.text(pdfText(kicker), MARGIN, y + 1);
@@ -198,13 +290,13 @@ export async function renderReportPdf(
       y += 5.2;
     }
 
-    y += 4;
+    y = (await import("./pdf-sections")).drawReadiness(doc, model.readiness, y + 2);
     font("helvetica", "bold", 12);
     doc.text("Overview", MARGIN, y);
     y += 3;
     y += await drawDiagram("overview", MARGIN, y, CONTENT_W, PAGE_H - MARGIN - 8 - y);
 
-    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions);
+    if (opts.rules) drawRulesPage(doc, opts.rules.spec, opts.rules.docName, opts.rules.questions, () => mark("Implementation rules", 1));
 
     // ---------- Cards (direct mappings and combined fields) ----------
     const PAD = 4;
@@ -306,6 +398,7 @@ export async function renderReportPdf(
 
     const sectionTitle = (title: string, intro?: string) => {
       newPage();
+      mark(title, 1);
       font("helvetica", "bold", 14);
       doc.text(title, MARGIN, y + 4);
       y += 10;
@@ -364,6 +457,7 @@ export async function renderReportPdf(
 
     // ---------- Appendix ----------
     newPage();
+    mark("Appendix", 1);
     font("helvetica", "bold", 14);
     doc.text("Appendix", MARGIN, y + 4);
     y += 12;
@@ -454,6 +548,9 @@ export async function renderReportPdf(
         y += 3.1;
       }
     }
-    if (opts.testCases) drawTestCases(doc, opts.testCases);
+    if (opts.testCases) drawTestCases(doc, opts.testCases, () => mark("Test cases", 1));
+    const withImpl = model as unknown as { implementation?: { dataPart: string; functions: Record<string, string>; mergeFunction?: string } | null; readiness: { id: string; status: "ok" | "warn" | "info"; title: string; detail: string; items: string[] }[] };
+    if (opts.testCases && withImpl.implementation)
+      (await import("./pdf-sections")).drawImplementation(doc, withImpl.implementation, "", withImpl.readiness.find((r) => r.id === "implementation"), () => mark("Reference implementation", 1));
   }
 }

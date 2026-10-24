@@ -86,6 +86,8 @@ export interface FieldTreeProps {
   flagged?: Map<string, string>;
   /** Rows to tint so they catch the eye (e.g. unmapped fields with no decision). */
   attention?: Set<string>;
+  /** While searching: the rows to show (matches, their parents and children). Everything expands. */
+  visibleIds?: Set<string>;
   /** Tinted rows also pulse (e.g. while the unmapped button is hovered). */
   pulse?: boolean;
   /** Title for the root row instead of "{ root }" (e.g. "Headers"). */
@@ -264,6 +266,7 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
   const isItem = node.key === ARRAY_ITEM;
   // Editable objects always show an "Add field" row, so they can be expanded.
   const expandable = node.children.length > 0 || (editable && node.type === "object");
+  if (props.visibleIds && !props.visibleIds.has(id)) return null;
 
   return (
     <div>
@@ -504,7 +507,7 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
           onSetArrayItems={props.onSetArrayItems}
         />
       )}
-      {open && <Children {...props} node={node} depth={depth + 1} />}
+      {(open || props.visibleIds) && <Children {...props} node={node} depth={depth + 1} />}
     </div>
   );
 }

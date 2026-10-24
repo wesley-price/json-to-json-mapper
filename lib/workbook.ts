@@ -96,16 +96,19 @@ export function genericPathId(label: string): string | null {
   }
 }
 
-export function flatSheet(name: string, data: Json | null, fixed: FixedValues = {}): Sheet {
+/** `types`: declared types from the object's schema (path JSON -> "long (timestamp-millis)"), shown in a "Schema type" column. */
+export function flatSheet(name: string, data: Json | null, fixed: FixedValues = {}, types?: Map<string, string>): Sheet {
+  const withTypes = !!types && types.size > 0;
   return {
     name,
     rows: [
-      ["Field", "Value", "Type", "Constant"],
+      ["Field", "Value", "Type", "Constant", ...(withTypes ? ["Schema type"] : [])],
       ...(data === null
         ? []
         : Object.entries(flatten(data)).map(([k, v]) => {
             const id = genericPathId(k);
-            return [...flatRow(k, v), fixedCell(id ? fixed[id] : undefined, v)];
+            const row: Cell[] = [...flatRow(k, v), fixedCell(id ? fixed[id] : undefined, v)];
+            return withTypes ? [...row, (id && types!.get(id)) || ""] : row;
           })),
     ],
   };
@@ -124,6 +127,8 @@ export function buildWorkbook(opts: {
   docName?: string;
   /** What each object is called. */
   names?: Record<Side, string>;
+  /** Declared types from each object's schema (Avro, CREATE TABLE). */
+  schemaTypes?: Partial<Record<Side, Map<string, string>>>;
 }): Sheet[] {
   const { primary, data, mappings, result, formats } = opts;
   const headers = opts.headers ?? { left: {}, right: {} };
@@ -141,7 +146,7 @@ export function buildWorkbook(opts: {
       ["Primary name", opts.names?.[primary] ?? ""],
       ["Target name", opts.names?.[secondary] ?? ""],
     ]),
-    flatSheet("Mapped Result", result),
+    flatSheet("Mapped Result", result, {}, opts.schemaTypes?.[secondary]),
     {
       name: "Mappings",
       rows: [
@@ -161,8 +166,8 @@ export function buildWorkbook(opts: {
         ]),
       ],
     },
-    flatSheet(`Primary (${primary})`, data[primary], opts.fixed?.[primary]),
-    flatSheet(`Target (${secondary})`, data[secondary], opts.fixed?.[secondary]),
+    flatSheet(`Primary (${primary})`, data[primary], opts.fixed?.[primary], opts.schemaTypes?.[primary]),
+    flatSheet(`Target (${secondary})`, data[secondary], opts.fixed?.[secondary], opts.schemaTypes?.[secondary]),
     {
       name: "Headers",
       rows: [

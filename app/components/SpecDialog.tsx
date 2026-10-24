@@ -4,10 +4,12 @@
 // it, which version, what it's for, and the rules a developer needs beyond the
 // field mappings. They print on the report's cover and rules page.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   COERCE_OPTIONS,
   type CoercePolicy,
+  DELETE_OPTIONS,
+  type DeletePolicy,
   MISSING_OPTIONS,
   type MissingPolicy,
   type Spec,
@@ -26,7 +28,9 @@ export function SpecDialog({ spec, onChange, onClose }: { spec: Spec; onChange: 
     return () => window.removeEventListener("keydown", esc);
   }, [onClose]);
   const set = (patch: Partial<Spec>) => onChange({ ...spec, ...patch });
-  const facts = describeRules(spec).slice(3);
+  // Open when streaming details exist; decided once so typing never collapses it.
+  const [streamOpenAtStart] = useState(() => [spec.inputTopics, spec.outputTopic, spec.messageKey, spec.joinKey, spec.deadLetterTopic].some((v) => v.trim()) || Boolean(spec.deletes));
+  const facts = describeRules(spec).slice(3, 7);
 
   const select = <T extends string>(
     label: string,
@@ -130,6 +134,38 @@ export function SpecDialog({ spec, onChange, onClose }: { spec: Spec; onChange: 
             />
           </label>
         </section>
+
+        <details className="group rounded-lg border border-zinc-200 dark:border-zinc-800" open={streamOpenAtStart}>
+          <summary className="cursor-pointer select-none px-3 py-2 text-sm font-semibold uppercase tracking-wide text-zinc-500">
+            Streaming (Kafka) <span className="font-normal normal-case tracking-normal">· optional</span>
+          </summary>
+          <div className="grid gap-3 border-t border-zinc-200 p-3 sm:grid-cols-2 dark:border-zinc-800">
+            {(
+              [
+                ["inputTopics", "Input topics", "shop.orders, shop.payments"],
+                ["outputTopic", "Output topic", "shop.order-summaries"],
+                ["messageKey", "Message key (output field)", "orderId"],
+                ["deadLetterTopic", "Dead-letter topic", "shop.order-summaries.dlq"],
+                ["joinKey", "Join key (merged sources)", "orderId"],
+                ["joinWindow", "Join window", "5 minutes"],
+              ] as const
+            ).map(([key, label, placeholder]) => (
+              <label key={key} className="flex flex-col gap-1">
+                <span className="text-sm font-medium">{label}</span>
+                <input value={spec[key]} onChange={(e) => set({ [key]: e.target.value })} placeholder={placeholder} aria-label={label} className={input} />
+              </label>
+            ))}
+            <div className="sm:col-span-2">
+              {select<DeletePolicy>(
+                "Deletes and tombstones",
+                spec.deletes,
+                DELETE_OPTIONS,
+                (deletes) => set({ deletes }),
+                'A tombstone is a message with a key and a null value; CDC tools mark deletes with op = "d".',
+              )}
+            </div>
+          </div>
+        </details>
 
         <section className="flex flex-col gap-1.5 rounded-lg bg-zinc-50 p-3 text-xs text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">
           <p className="font-medium text-zinc-700 dark:text-zinc-300">Also stated in the report (how the mapping behaves):</p>

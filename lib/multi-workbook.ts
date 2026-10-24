@@ -36,6 +36,8 @@ export interface MultiDocSide {
   fixed: FixedValues;
   /** More values a field can carry (pathId -> values), e.g. other messages for the same error. */
   moreValues?: Record<string, Json[]>;
+  /** Declared types from the object's schema (export only: a "Schema type" column). */
+  schemaTypes?: Map<string, string>;
 }
 
 /** A mapping from a source field (or constant) into a standard field. */
@@ -51,6 +53,8 @@ export interface MultiDocMapping {
 
 export interface MultiDoc {
   docName: string;
+  /** How sources combine: each on its own, or all merged into one object. */
+  combine?: "each" | "merge";
   standard: MultiDocSide;
   sources: {
     name: string;
@@ -110,6 +114,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
       ["Property", "Value"],
       ["Name", doc.docName],
       ["Mode", "multi-source"],
+      ["Combine sources", doc.combine === "merge" ? "merged into one" : "one at a time"],
       ["Standard name", doc.standard.name ?? ""],
       ["Standard format", doc.standard.format],
       ["Standard flat layout", layoutCell(doc.standard)],
@@ -136,7 +141,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
     });
   }
 
-  sheets.push(flatSheet("Standard", doc.standard.data, doc.standard.fixed));
+  sheets.push(flatSheet("Standard", doc.standard.data, doc.standard.fixed, doc.standard.schemaTypes));
   sheets.push({
     name: "Sources",
     rows: [
@@ -144,7 +149,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
       ...doc.sources.map((s, i): Cell[] => [i + 1, s.name, s.side.format, layoutCell(s.side)]),
     ],
   });
-  doc.sources.forEach((s, i) => sheets.push(flatSheet(sourceSheetName(i + 1, s.name), s.side.data, s.side.fixed)));
+  doc.sources.forEach((s, i) => sheets.push(flatSheet(sourceSheetName(i + 1, s.name), s.side.data, s.side.fixed, s.side.schemaTypes)));
 
   const headerRows = (object: string, side: MultiDocSide): Cell[][] =>
     Object.entries(side.headers ?? {}).map(([name, value]) => {
@@ -406,7 +411,12 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
   for (const src of sources) if (src?.examples) src.examples = src.examples.filter(Boolean);
 
   return {
-    doc: { docName: String(prop("Name") ?? "").trim(), standard, sources: sources.filter(Boolean) },
+    doc: {
+      docName: String(prop("Name") ?? "").trim(),
+      combine: /merge/i.test(String(prop("Combine sources") ?? "")) ? "merge" : "each",
+      standard,
+      sources: sources.filter(Boolean),
+    },
     warnings,
   };
 }

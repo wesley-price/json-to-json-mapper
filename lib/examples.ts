@@ -119,11 +119,116 @@ DTL|||0|0
 TRL|0|0
 `;
 
+// The same order as database tables: definitions plus a sample row each.
+const SOURCE_TABLE = `CREATE TABLE orders (
+  order_id      VARCHAR(20) PRIMARY KEY,
+  order_date    DATE NOT NULL,
+  customer_id   INTEGER REFERENCES customers(id),
+  total         NUMERIC(10,2)
+);
+CREATE TABLE customers (
+  id          INTEGER PRIMARY KEY,
+  first_name  VARCHAR(50),
+  last_name   VARCHAR(50),
+  email       VARCHAR(255)
+);
+INSERT INTO orders VALUES ('A-1001', '2026-10-18', 1042, 25.48);
+INSERT INTO customers VALUES (1042, 'Ada', 'Lovelace', 'ada@example.com');
+`;
+
+const TARGET_TABLE = `CREATE TABLE invoices (
+  reference    VARCHAR(20) PRIMARY KEY,
+  placed_on    DATE,
+  buyer_name   VARCHAR(120),
+  buyer_email  VARCHAR(255),
+  grand_total  NUMERIC(10,2)
+);
+`;
+
+// The order as a Kafka event, and as an Avro schema; the invoice likewise.
+const SOURCE_KAFKA = JSON.stringify(
+  {
+    topic: "shop.orders",
+    key: "A-1001",
+    headers: { "event-type": "OrderPlaced", traceparent: "00-4bf92f3577b34da6-01" },
+    timestamp: "2026-10-18T09:30:00Z",
+    value: {
+      orderId: "A-1001",
+      customer: { id: 1042, firstName: "Ada", lastName: "Lovelace", email: "ada@example.com" },
+      lines: [
+        { sku: "X1", qty: 2, price: 9.99 },
+        { sku: "Y2", qty: 1, price: 5.5 },
+      ],
+      total: 25.48,
+    },
+  },
+  null,
+  2,
+);
+
+const SOURCE_AVRO = JSON.stringify(
+  {
+    type: "record",
+    name: "OrderPlaced",
+    namespace: "com.shop.orders",
+    fields: [
+      { name: "orderId", type: "string" },
+      { name: "placedAt", type: { type: "long", logicalType: "timestamp-millis" } },
+      {
+        name: "customer",
+        type: {
+          type: "record",
+          name: "Customer",
+          fields: [
+            { name: "id", type: "long" },
+            { name: "email", type: ["null", "string"], default: null },
+          ],
+        },
+      },
+      { name: "status", type: { type: "enum", name: "OrderStatus", symbols: ["PLACED", "PAID", "SHIPPED"] } },
+      { name: "total", type: { type: "bytes", logicalType: "decimal", precision: 10, scale: 2 } },
+    ],
+  },
+  null,
+  2,
+);
+
+const TARGET_AVRO = JSON.stringify(
+  {
+    type: "record",
+    name: "InvoiceIssued",
+    namespace: "com.shop.billing",
+    fields: [
+      { name: "reference", type: "string", doc: "The order number" },
+      { name: "buyerEmail", type: ["null", "string"], default: null },
+      { name: "grandTotal", type: "double" },
+      { name: "currency", type: "string", default: "GBP" },
+    ],
+  },
+  null,
+  2,
+);
+
+const TARGET_KAFKA = JSON.stringify(
+  {
+    topic: "shop.invoices",
+    key: "",
+    headers: { "event-type": "InvoiceIssued" },
+    timestamp: "",
+    value: { reference: "", buyer: { name: "", email: "" }, grandTotal: 0 },
+  },
+  null,
+  2,
+);
+
 export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> = {
   source: {
     json: { text: JSON.stringify(SOURCE_JSON, null, 2), layout: defaultFlatLayout(), headers: SOURCE_HEADERS },
     xml: { text: SOURCE_XML, layout: defaultFlatLayout(), headers: SOURCE_HEADERS },
     csv: { text: SOURCE_CSV, layout: defaultFlatLayout() },
+    table: { text: SOURCE_TABLE, layout: defaultFlatLayout() },
+    avro: { text: SOURCE_AVRO, layout: defaultFlatLayout() },
+    kafka: { text: SOURCE_KAFKA, layout: defaultFlatLayout() },
     flat: {
       text: SOURCE_FLAT,
       layout: flatLayout(
@@ -140,6 +245,9 @@ export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> 
     json: { text: JSON.stringify(TARGET_JSON, null, 2), layout: defaultFlatLayout() },
     xml: { text: TARGET_XML, layout: defaultFlatLayout() },
     csv: { text: TARGET_CSV, layout: defaultFlatLayout() },
+    table: { text: TARGET_TABLE, layout: defaultFlatLayout() },
+    avro: { text: TARGET_AVRO, layout: defaultFlatLayout() },
+    kafka: { text: TARGET_KAFKA, layout: defaultFlatLayout() },
     flat: {
       text: TARGET_FLAT,
       layout: flatLayout(
@@ -262,6 +370,88 @@ export const MULTI_EXAMPLE: MultiExampleSource[] = [
         ],
         constants: [["legacy", ["error", "sourceSystem"]]],
         translate: { "error.code": { pairs: [["E42", "ACC-423"]], otherwise: "keep", defaultValue: "" } },
+      },
+    ],
+  },
+];
+
+// ---------- merged multi-source example: three systems fill one order summary ----------
+
+export const MERGE_STANDARD = {
+  orderId: "",
+  placedAt: "",
+  customer: { id: 0, name: "", email: "", tier: "" },
+  payment: { method: "", status: "", amount: 0 },
+  shipping: { carrier: "", trackingNumber: "" },
+  channel: "",
+};
+
+export const MERGE_EXAMPLE: MultiExampleSource[] = [
+  {
+    name: "CRM (customers table)",
+    format: "table",
+    text: `CREATE TABLE customers (
+  id            INTEGER PRIMARY KEY,
+  full_name     VARCHAR(120),
+  email         VARCHAR(255),
+  loyalty_tier  VARCHAR(20)
+);
+INSERT INTO customers VALUES (1042, 'Ada Lovelace', 'ada@example.com', 'gold');
+`,
+    cases: [
+      {
+        name: "All",
+        when: [],
+        maps: [
+          [["customers", "id"], ["customer", "id"]],
+          [["customers", "full_name"], ["customer", "name"]],
+          [["customers", "email"], ["customer", "email"]],
+          [["customers", "loyalty_tier"], ["customer", "tier"]],
+        ],
+      },
+    ],
+  },
+  {
+    name: "Order service",
+    format: "json",
+    text: JSON.stringify(
+      { id: "A-1001", createdAt: "2026-10-18T09:30:00Z", customerId: 1042, shipping: { carrier: "UPS", tracking: "1Z999AA10123456784" } },
+      null,
+      2,
+    ),
+    cases: [
+      {
+        name: "All",
+        when: [],
+        maps: [
+          [["id"], ["orderId"]],
+          [["createdAt"], ["placedAt"]],
+          [["customerId"], ["customer", "id"]],
+          [["shipping", "carrier"], ["shipping", "carrier"]],
+          [["shipping", "tracking"], ["shipping", "trackingNumber"]],
+        ],
+        constants: [["web", ["channel"]]],
+      },
+    ],
+  },
+  {
+    name: "Payments",
+    format: "xml",
+    text: `<payment order="A-1001">
+  <method>card</method>
+  <status>captured</status>
+  <amount currency="GBP">25.48</amount>
+</payment>
+`,
+    cases: [
+      {
+        name: "All",
+        when: [],
+        maps: [
+          [["payment", "method"], ["payment", "method"]],
+          [["payment", "status"], ["payment", "status"]],
+          [["payment", "amount", "#text"], ["payment", "amount"]],
+        ],
       },
     ],
   },

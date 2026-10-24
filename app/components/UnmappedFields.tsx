@@ -5,6 +5,7 @@
 // or be tagged as a constant, so nothing is left to the implementer's guess.
 
 import { useEffect, useRef, useState } from "react";
+import { Icon } from "./Icon";
 import type { Path } from "@/lib/json-tree";
 import { type FieldDecision, type UnmappedField, UNMAPPED_OPTIONS, UNMAPPED_SHORT as short, type UnmappedPolicy } from "@/lib/spec";
 
@@ -101,7 +102,7 @@ export function UnmappedChip({
         title={highlight ? "Highlighting unmapped fields in the tree (click to turn off)" : "Unmapped fields aren't highlighted in the tree (click to turn on)"}
         className={`rounded px-1 text-xs ${highlight ? "text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-950" : "text-zinc-400 line-through hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
       >
-        ◐
+        <Icon name="contrast" />
       </button>
       {fields.length > 1 && (
         <>

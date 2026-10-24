@@ -5,9 +5,10 @@
 // per case, and the sample's normalised result).
 
 import { formatInfo } from "@/lib/formats";
-import { MappingDiagram, allRows, constantRow } from "./MappingDiagram";
+import { MappingDiagram, constantRow, rowsFor } from "./MappingDiagram";
+import { isConstPath } from "@/lib/transforms";
 import type { MultiReportModel, MultiReportSource } from "./multi-model";
-import { RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
+import { ReadinessBlock, RulesSection, SpecRows, TestCasesSection } from "./SpecSections";
 
 function SourceSection({ src, report, prefix }: { src: MultiReportSource; report: MultiReportModel; prefix: string }) {
   const sourceTitle = `${src.name} · ${formatInfo(src.format).label}`;
@@ -54,10 +55,10 @@ function SourceSection({ src, report, prefix }: { src: MultiReportSource; report
             <MappingDiagram
               diagramId={prefix + c.id}
               source={[
-                ...allRows(src.tree),
+                ...rowsFor(src.tree, c.mappings.map((m) => m.from).filter((p) => !isConstPath(p))).rows,
                 ...c.mappings.filter((m) => m.constant !== undefined).map((m) => constantRow(m.from, m.constant, m.db)),
               ]}
-              target={allRows(report.standard.tree)}
+              target={rowsFor(report.standard.tree, c.mappings.map((m) => m.to)).rows}
               links={c.links}
               sourceTitle={sourceTitle}
               targetTitle={report.standard.title}
@@ -229,8 +230,13 @@ export function MultiReport({
           )}
         </dl>
 
+        <ReadinessBlock items={report.readiness} />
+
         <h2 className="mt-6 mb-2 text-base font-semibold">Coverage</h2>
-        <p className="mb-2 text-xs text-zinc-500">Which source field feeds each standard field. Gaps are marked —.</p>
+        <p className="mb-2 text-xs text-zinc-500">
+          Which source field feeds each standard field. Gaps are marked —.
+          {report.combine === "merge" && " Sources are merged into one object, so a field only needs one source."}
+        </p>
         <table className="w-full border-collapse text-left text-xs">
           <thead>
             <tr className="text-zinc-500">
@@ -256,6 +262,41 @@ export function MultiReport({
           </tbody>
         </table>
       </section>
+
+      {report.merged && (
+        <section className="mt-8">
+          <h2 className="mb-1 text-base font-semibold">Merged result</h2>
+          <p className="mb-2 text-xs text-zinc-500">
+            All sources fill this one {report.standard.name} object together, in source order. A later source only
+            overwrites a field it has a value for.
+          </p>
+          <table className="mb-3 w-full text-left text-xs">
+            <tbody>
+              {report.merged.used.map((u) => (
+                <tr key={u.name} className="border-t border-zinc-100">
+                  <td className="py-1 pr-3 font-medium">{u.name}</td>
+                  <td className={`py-1 ${u.error ? "text-amber-700" : "text-zinc-600"}`}>{u.error ?? `case “${u.caseName}”`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {report.merged.conflicts.length > 0 && (
+            <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+              <p className="mb-1 font-medium">Fields more than one source fills (the last one wins):</p>
+              <ul className="list-disc pl-5">
+                {report.merged.conflicts.map((c) => (
+                  <li key={c.field}>
+                    <span className="font-mono">{c.field}</span>: {c.sources.join(", ")} → <span className="font-medium">{c.winner}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <pre className="whitespace-pre-wrap break-all rounded-md border border-zinc-200 bg-zinc-50 p-3 font-mono text-[10px] leading-snug">
+            {report.merged.text}
+          </pre>
+        </section>
+      )}
 
       {sections && <RulesSection spec={report.spec} docName={docName} questions={report.openQuestions} />}
 

@@ -41,13 +41,36 @@ function sheetNames(sheets: Sheet[]): string[] {
   });
 }
 
+/** Excel's limit on the characters in one cell. */
+export const EXCEL_CELL_MAX = 32767;
+
+/** Split long text into pieces that each fit in a cell (one row per piece). */
+export function chunkText(text: string, size = 30000): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
+  return out.length ? out : [""];
+}
+
+/** Cells longer than Excel allows (they are cut to fit when written). */
+export function oversizedCells(sheets: Sheet[]): { sheet: string; cell: string; length: number }[] {
+  const out: { sheet: string; cell: string; length: number }[] = [];
+  for (const sh of sheets) {
+    sh.rows.forEach((row, r) =>
+      row.forEach((v, c) => {
+        if (typeof v === "string" && v.length > EXCEL_CELL_MAX) out.push({ sheet: sh.name, cell: `${columnName(c)}${r + 1}`, length: v.length });
+      }),
+    );
+  }
+  return out;
+}
+
 function cellXml(value: Cell, ref: string, header: boolean): string {
   const style = header ? ' s="1"' : "";
   if (value === null || value === "") return "";
   if (typeof value === "number" && Number.isFinite(value)) return `<c r="${ref}"${style}><v>${value}</v></c>`;
   if (typeof value === "boolean") return `<c r="${ref}"${style} t="b"><v>${value ? 1 : 0}</v></c>`;
   // Excel caps a cell at 32,767 characters.
-  const text = escapeXml(String(value).slice(0, 32767));
+  const text = escapeXml(String(value).slice(0, EXCEL_CELL_MAX));
   return `<c r="${ref}"${style} t="inlineStr"><is><t xml:space="preserve">${text}</t></is></c>`;
 }
 

@@ -51,11 +51,13 @@ interface Props {
   /** Top-level fields outside header / body / footer (not written to the file). */
   strayFields: string[];
   onMoveStray: (into: "body" | "header") => void;
+  /** Rewrite the file with a new layout, keeping the data (instead of re-reading the text with it). */
+  onConvert: (layout: FlatLayout) => void;
 }
 
 const cellText = (v: Json | undefined) => (v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v));
 
-export function FlatLayoutEditor({ layout, role, text, data, currentFields, hasSections, onApply, onAddSections, strayFields, onMoveStray }: Props) {
+export function FlatLayoutEditor({ layout, role, text, data, currentFields, hasSections, onApply, onAddSections, strayFields, onMoveStray, onConvert }: Props) {
   const source = role === "source";
   const unnamed = source && SECTIONS.some((s) => layout[s].enabled && (layout[s].fields.length === 0 || layout[s].fields.some(isDefaultName)));
   // Closed until asked for (unnamed fields are flagged on the bar instead).
@@ -88,6 +90,14 @@ export function FlatLayoutEditor({ layout, role, text, data, currentFields, hasS
   const setSection = (name: SectionName, patch: Partial<FlatSection>, now = false) =>
     change({ ...draft, [name]: { ...draft[name], ...patch } }, now);
 
+  // A loaded source asked for another separator: convert the file, or re-read it?
+  const [pendingSep, setPendingSep] = useState<Delimiter | null>(null);
+  const loaded = source && data !== null && text.trim() !== "";
+  const pickSeparator = (d: Delimiter) => {
+    if (d === draft.delimiter) return setPendingSep(null);
+    if (loaded) setPendingSep(d);
+    else change({ ...draft, delimiter: d }, true);
+  };
   const fixed = draft.delimiter === "fixed";
   const lines = useMemo(() => (source && text.trim() ? sectionLines(text, draft) : null), [source, text, draft]);
   const totalLines = useMemo(() => text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim()).length, [text]);
@@ -141,8 +151,8 @@ export function FlatLayoutEditor({ layout, role, text, data, currentFields, hasS
             <label className="flex items-center gap-1">
               Fields separated by
               <select
-                value={draft.delimiter}
-                onChange={(e) => change({ ...draft, delimiter: e.target.value as Delimiter }, true)}
+                value={pendingSep ?? draft.delimiter}
+                onChange={(e) => pickSeparator(e.target.value as Delimiter)}
                 aria-label="Field separator"
                 className="rounded border border-zinc-300 bg-white px-1 py-0.5 dark:border-zinc-700 dark:bg-zinc-900"
               >
@@ -180,6 +190,42 @@ export function FlatLayoutEditor({ layout, role, text, data, currentFields, hasS
             <p className="text-zinc-500">
               Fixed width: click a character on a ruler to start a new column there; click a column&apos;s first character again to join it to the one before.
             </p>
+          )}
+
+          {pendingSep && (
+            <div role="group" aria-label="Change separator" className="flex flex-wrap items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-blue-950 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-100">
+              <span>
+                Change from <b>{delimiterLabel(draft.delimiter)}</b> to <b>{delimiterLabel(pendingSep)}</b>:
+              </span>
+              <button
+                onClick={() => {
+                  const next = { ...draft, delimiter: pendingSep };
+                  lastSent.current = "";
+                  setPendingSep(null);
+                  onConvert(next);
+                }}
+                className="rounded bg-blue-600 px-1.5 py-0.5 font-medium text-white hover:bg-blue-700"
+                title="Keep the data and mappings; the file is written again with the new separator"
+              >
+                Convert the file
+              </button>
+              <button
+                onClick={() => {
+                  setPendingSep(null);
+                  change({ ...draft, delimiter: pendingSep }, true);
+                }}
+                className="rounded border border-blue-300 px-1.5 py-0.5 hover:bg-blue-100 dark:border-blue-800 dark:hover:bg-blue-900"
+                title="The file really is separated this way: read the same text again with it"
+              >
+                Re-read it as {delimiterLabel(pendingSep)}
+              </button>
+              <button onClick={() => setPendingSep(null)} className="text-blue-700 hover:underline dark:text-blue-300">
+                Cancel
+              </button>
+              <span className="w-full text-blue-900/70 dark:text-blue-200/70">
+                Convert keeps the data and mappings and rewrites the file{pendingSep === "fixed" ? " (each field as long as its longest value)" : ""}. Re-read is for a file that was read with the wrong separator.
+              </span>
+            </div>
           )}
 
           {skipped > 0 && (

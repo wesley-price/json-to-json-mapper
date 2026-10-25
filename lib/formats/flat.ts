@@ -406,3 +406,21 @@ export function wrapInSection(data: Json, into: "body" | "header"): { data: Json
     move: (p) => (p.length && strays.has(p[0]) ? (into === "header" ? ["header", ...p] : ["body", "[]", ...p]) : p),
   };
 }
+
+/**
+ * A layout to convert data to: for fixed width, every field gets the length
+ * of its longest value (so the written file reads back the same).
+ */
+export function fittedLayout(layout: FlatLayout, data: Json): FlatLayout {
+  if (layout.delimiter !== "fixed") return layout;
+  const obj: Obj = isRecord(data) ? data : {};
+  const next = { ...layout };
+  for (const name of SECTIONS) {
+    const records = recordsOf(obj, name);
+    if (!records.length) continue;
+    const fields = Object.keys(records[0]);
+    const widths = Object.fromEntries(fields.map((f) => [f, Math.max(1, ...records.map((r) => cell(r[f] ?? null).length))]));
+    next[name] = { ...layout[name], fields, widths };
+  }
+  return next;
+}

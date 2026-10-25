@@ -46,7 +46,7 @@ import {
   readFormat,
   writeFormat,
 } from "@/lib/formats";
-import { SECTIONS, type SectionName, detectLayout, layoutFits, layoutRenames, strayFields, syncLayoutFields, wrapInSection } from "@/lib/formats/flat";
+import { SECTIONS, type SectionName, detectLayout, fittedLayout, layoutFits, layoutRenames, strayFields, syncLayoutFields, wrapInSection } from "@/lib/formats/flat";
 import { inferScalar } from "@/lib/formats/xml";
 import { EXAMPLES, MERGE_EXAMPLE, MERGE_STANDARD, MULTI_EXAMPLE, STANDARD_ERROR } from "@/lib/examples";
 import { DEFAULT_DOC_NAME, fileSlug } from "@/lib/names";
@@ -1338,7 +1338,28 @@ export default function ObjectMapper() {
   const applyLayout = (side: Side, layout: FlatLayout) => {
     const st = sides[side];
     if (side === sourceSide && st.text.trim()) {
-      readSide(side, layout, layoutRenames(st.layout, layout), true);
+      const move = layoutRenames(st.layout, layout);
+      // Say which mappings a re-read takes away (their fields aren't in the file read this way).
+      let lost: Mapping[] = [];
+      try {
+        const valid = allPaths(buildTree(readFormat(st.format, st.text.trim(), layout).data));
+        lost = mappings.filter((m) => {
+          const p = move ? move(m[side]) : m[side];
+          return !isHeaderPath(p) && !isConstPath(p) && !valid.has(pathId(rowPath(p)));
+        });
+      } catch {
+        // unreadable with this layout: readSide reports it
+      }
+      readSide(side, layout, move, true);
+      if (lost.length) {
+        const one = lost.length === 1;
+        setNotice({
+          kind: "error",
+          text: `Read this way, the file no longer has the field${one ? "" : "s"} ${one ? "a mapping" : `${lost.length} mappings`} used, so ${one ? "it was" : "they were"} removed. Undo (Ctrl+Z, or ↶ at the top) brings ${one ? "it" : "them"} back.`,
+          details: lost.map((m) => `${pathLabel(m[side])} → ${pathLabel(m[other(side)])}`),
+          label: "Removed:",
+        });
+      }
       return;
     }
     setSides((s) => {
@@ -1347,6 +1368,15 @@ export default function ObjectMapper() {
       return { ...s, [side]: { ...cur, layout, text } };
     });
   };
+
+  /** Rewrite a flat file with another layout (e.g. pipes to fixed width), keeping its data and mappings. */
+  const convertFlat = (side: Side, layout: FlatLayout) =>
+    setSides((s) => {
+      const cur = s[side];
+      if (cur.data === null) return { ...s, [side]: { ...cur, layout } };
+      const next = fittedLayout(layout, cur.data);
+      return { ...s, [side]: { ...cur, layout: next, text: writeFormat("flat", cur.data, next), error: null } };
+    });
 
   /** Put a side's top-level fields into a flat file's body or header (mappings and tags follow). */
   const moveIntoSection = (side: Side, into: "body" | "header") => {
@@ -2838,6 +2868,7 @@ export default function ObjectMapper() {
             data={state.data}
             strayFields={strayFields(state.data)}
             onMoveStray={(into) => moveIntoSection(side, into)}
+            onConvert={(layout) => convertFlat(side, layout)}
             currentFields={sectionFields(state.data)}
             hasSections={SECTIONS.some((n) => sectionFields(state.data)[n].length > 0)}
             onApply={(layout) => applyLayout(side, layout)}

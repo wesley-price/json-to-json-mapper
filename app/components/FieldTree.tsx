@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrayExamples } from "./ArrayExamples";
 import { MoreValuesEditor } from "./MoreValues";
 import { ConstantFields, draftOf, fromDraft } from "./TranslationEditor";
@@ -15,6 +15,7 @@ import {
   type Side,
   isPrefix,
   pathId,
+  pathLabel,
 } from "@/lib/json-tree";
 
 export const FIELD_TYPES: FieldType[] = ["string", "number", "boolean", "object", "array", "null"];
@@ -38,6 +39,8 @@ export interface FieldTreeProps {
   root: FieldNode;
   side: Side;
   editable: boolean;
+  /** Fields can be moved by dragging even though the tree isn't editable (a flat primary sorting fields into sections). */
+  movable?: boolean;
   selectedId: string | null;
   /** pathId -> color for fields that take part in a mapping */
   mappedColors: Map<string, string>;
@@ -128,7 +131,7 @@ function dropIntentFor(drag: Drag, props: FieldTreeProps, node: FieldNode): Drop
   const { side, editable } = props;
   if (drag.side !== side) return node.path.length ? { kind: "map", label: "map to this field" } : null;
   if (isPrefix(drag.path, node.path)) return null; // the field itself or something inside it
-  if (!editable) return { kind: "blocked", label: "primary is locked" };
+  if (!editable && !props.movable) return { kind: "blocked", label: "primary is locked" };
   const itemType = node.type === "array" ? node.children[0]?.type : undefined;
   if (itemType && itemType !== "object") {
     return { kind: "blocked", label: `list of ${itemType}s can't hold fields` };
@@ -258,6 +261,16 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
   const [editingMore, setEditingMore] = useState(false);
   const drop = useFieldDropZone(props, node);
   const dragging = useIsDragSource(side, node.path);
+  // A name cut off by the row's width is shown in full, over the row, while the row is hovered.
+  const nameRef = useRef<HTMLSpanElement>(null);
+  const [fullName, setFullName] = useState<{ left: number; top: number; height: number } | null>(null);
+  useEffect(() => {
+    if (!fullName) return;
+    // It is placed on screen, so it goes when anything scrolls.
+    const hide = () => setFullName(null);
+    window.addEventListener("scroll", hide, true);
+    return () => window.removeEventListener("scroll", hide, true);
+  }, [fullName]);
 
   const id = pathId(node.path);
   const color = mappedColors.get(id);
@@ -278,8 +291,18 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
           beginDrag(e, { side, path: node.path, label: isItem ? "each item" : node.key })
         }
         onClick={() => props.onSelect(node.path)}
-        onMouseEnter={() => props.onHoverField(node.path)}
-        onMouseLeave={() => props.onHoverField(null)}
+        onMouseEnter={() => {
+          props.onHoverField(node.path);
+          const el = nameRef.current;
+          if (el && el.scrollWidth > el.clientWidth) {
+            const r = el.getBoundingClientRect();
+            setFullName({ left: r.left, top: r.top, height: r.height });
+          }
+        }}
+        onMouseLeave={() => {
+          props.onHoverField(null);
+          setFullName(null);
+        }}
         className={[
           "group relative flex cursor-pointer select-none items-center gap-1.5 rounded-md border py-1 pr-2 transition-colors",
           dragging ? "opacity-40" : "",
@@ -324,13 +347,25 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
           </span>
         ) : (
           <span
-            className="truncate text-zinc-900 dark:text-zinc-100"
+            ref={nameRef}
+            // The name wins the space over its value; when it is still cut off, hovering the row shows it in full.
+            className="min-w-[3ch] max-w-[60%] shrink-0 truncate text-zinc-900 dark:text-zinc-100"
             onDoubleClick={(e) => {
               if (!editable) return;
               e.stopPropagation();
               setRenaming(true);
             }}
-            title={editable ? "Double-click to rename" : undefined}
+            title={`${pathLabel(node.path)}${editable ? " · double-click to rename" : ""}`}
+          >
+            {node.key}
+          </span>
+        )}
+        {fullName && !renaming && !isItem && (
+          // Fixed so it isn't clipped by the panel's scroll box.
+          <span
+            role="tooltip"
+            className="pointer-events-none fixed z-50 flex items-center whitespace-nowrap rounded bg-zinc-900 px-1.5 text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900"
+            style={{ left: fullName.left - 6, top: fullName.top - 2, minHeight: fullName.height + 4 }}
           >
             {node.key}
           </span>
@@ -353,7 +388,7 @@ function FieldRow(props: FieldTreeProps & { node: FieldNode; depth: number; sibl
               onChange={(v) => props.onSetValue(node.path, v)}
             />
           ) : (
-            <span className="truncate text-xs text-zinc-400">{JSON.stringify(node.sample)}</span>
+            <span className="min-w-0 truncate text-xs text-zinc-400" title={JSON.stringify(node.sample)}>{JSON.stringify(node.sample)}</span>
           ))}
 
         {props.onToggleFixed &&
@@ -780,13 +815,13 @@ function ValueEditor({ value, type, onChange }: { value: Json; type: FieldType; 
   const [draft, setDraft] = useState("");
   const shown = JSON.stringify(value);
   const valueClass =
-    "max-w-56 truncate rounded px-1 text-left font-mono text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-100";
+    "min-w-0 max-w-56 truncate rounded px-1 text-left font-mono text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-100";
 
   if (type === "boolean") {
     return (
       <button
         className={valueClass}
-        title="Click to flip"
+        title={`${shown} · click to flip`}
         onClick={(e) => {
           e.stopPropagation();
           onChange(!value);
@@ -801,7 +836,7 @@ function ValueEditor({ value, type, onChange }: { value: Json; type: FieldType; 
     return (
       <button
         className={`${valueClass} ${value === "" ? "italic text-zinc-400" : ""}`}
-        title="Click to edit the example value"
+        title={value === "" ? "Click to add an example value" : `${shown} · click to edit`}
         onClick={(e) => {
           e.stopPropagation();
           setDraft(typeof value === "string" ? value : String(value));

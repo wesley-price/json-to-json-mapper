@@ -16,8 +16,7 @@ import {
   isPrefix,
   joinsFor,
   pathId,
-  pathLabel,
-} from "@/lib/json-tree";
+  pathLabel, rowPath } from "@/lib/json-tree";
 import { type Condition, type MappingCase, type SourceExample, applyExample, describeConditions, describeExample, pickCase } from "@/lib/multi";
 import { type FixedValues, describeDb, describeFixed, describeTranslation, engineInputs, isConstPath, sourceLabel } from "@/lib/transforms";
 import { type FieldDecisions, type FieldQuestions, type Spec, UNMAPPED_OPTIONS, UNMAPPED_SHORT, applyRules, normalizeSpec } from "@/lib/spec";
@@ -25,6 +24,8 @@ import type { DiagramLink } from "./MappingDiagram";
 import { type TestCase, type TestCaseDraft, numberCases, someHeaders } from "./test-cases";
 import { mergeSources } from "@/lib/merge";
 import { dbConstantsOf, readinessOf } from "@/lib/readiness";
+import { describeSteps } from "@/lib/steps";
+import { describeJoin } from "./model";
 import { unmappedFields } from "@/lib/spec";
 
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
@@ -164,11 +165,12 @@ export function buildMultiReport(saved: SavedMulti | null) {
           ...(fromSchema || toSchema ? [`Schema types: ${fromSchema ?? "?"} → ${toSchema ?? "?"}.`] : []),
           ...(isConst ? [m.db ? `Comes from the ${describeDb(m.db)}.` : "A fixed value (constant)."] : []),
           ...(tag ? [`Source field tagged as a constant: ${describeFixed(tag)}.`] : []),
+          ...(m.steps?.length ? [`Transformed: ${describeSteps(m.steps)}.`] : []),
           ...(m.translate ? [`Values translated: ${describeTranslation(m.translate)}.`] : []),
           ...(m.note?.trim() ? [`Note: ${m.note.trim()}`] : []),
           ...(group.length > 1
             ? [
-                `Part ${group.indexOf(m) + 1} of ${group.length}, joined with ${JSON.stringify(group.find((g) => g.join !== undefined)?.join ?? " ")}.`,
+                `Part ${group.indexOf(m) + 1} of ${group.length}, combined as ${describeJoin(group.find((g) => g.join !== undefined)?.join ?? " ")}.`,
               ]
             : []),
         ];
@@ -192,7 +194,7 @@ export function buildMultiReport(saved: SavedMulti | null) {
         note: c.note?.trim() ?? "",
         usedBySample: firstMatch?.id === c.id,
         mappings,
-        links: mappings.map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color })),
+        links: mappings.map((m) => ({ from: pathId(rowPath(m.from)), to: pathId(m.to), color: m.color })),
       };
     });
 

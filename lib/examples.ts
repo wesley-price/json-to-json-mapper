@@ -221,6 +221,51 @@ const TARGET_KAFKA = JSON.stringify(
   2,
 );
 
+// The order and the invoice as JSON Schemas (as found in an OpenAPI spec).
+const SOURCE_JSONSCHEMA = JSON.stringify(
+  {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    required: ["orderId", "orderDate"],
+    properties: {
+      orderId: { type: "string", example: "A-1001" },
+      orderDate: { type: "string", format: "date", example: "2026-10-18" },
+      customer: {
+        type: "object",
+        properties: {
+          firstName: { type: "string", example: "Ada" },
+          lastName: { type: "string", example: "Lovelace" },
+          email: { type: "string", format: "email", example: "ada@example.com" },
+        },
+      },
+      total: { type: "number", example: 25.48 },
+    },
+  },
+  null,
+  2,
+);
+
+const TARGET_JSONSCHEMA = JSON.stringify(
+  {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    required: ["reference", "status", "grandTotal"],
+    additionalProperties: false,
+    properties: {
+      reference: { type: "string", pattern: "^[A-Z]-\\d+$", description: "The order number" },
+      issuedOn: { type: "string", format: "date-time" },
+      status: { type: "string", enum: ["DRAFT", "ISSUED", "PAID"] },
+      buyer: {
+        type: "object",
+        properties: { name: { type: "string", maxLength: 80 }, email: { type: "string", format: "email" } },
+      },
+      grandTotal: { type: "number", minimum: 0 },
+    },
+  },
+  null,
+  2,
+);
+
 export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> = {
   source: {
     json: { text: JSON.stringify(SOURCE_JSON, null, 2), layout: defaultFlatLayout(), headers: SOURCE_HEADERS },
@@ -229,6 +274,7 @@ export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> 
     table: { text: SOURCE_TABLE, layout: defaultFlatLayout() },
     avro: { text: SOURCE_AVRO, layout: defaultFlatLayout() },
     kafka: { text: SOURCE_KAFKA, layout: defaultFlatLayout() },
+    jsonschema: { text: SOURCE_JSONSCHEMA, layout: defaultFlatLayout() },
     flat: {
       text: SOURCE_FLAT,
       layout: flatLayout(
@@ -248,6 +294,7 @@ export const EXAMPLES: Record<"source" | "target", Record<Format, ExampleFile>> 
     table: { text: TARGET_TABLE, layout: defaultFlatLayout() },
     avro: { text: TARGET_AVRO, layout: defaultFlatLayout() },
     kafka: { text: TARGET_KAFKA, layout: defaultFlatLayout() },
+    jsonschema: { text: TARGET_JSONSCHEMA, layout: defaultFlatLayout() },
     flat: {
       text: TARGET_FLAT,
       layout: flatLayout(

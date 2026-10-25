@@ -6,6 +6,7 @@
 //   (e.g. INSUFFICIENT_FUNDS -> PAY-001), with a rule for anything else.
 
 import { type Json, type Mapping, type Path, pathLabel } from "./json-tree";
+import { applySteps } from "./steps";
 import { inferScalar } from "./formats/xml";
 
 export const CONST = "$const";
@@ -80,8 +81,14 @@ export function translateValue(value: Json, t: Translation): Json {
 /** The value transform for a mapping (its translation table), if it has one. */
 export function transformOf(m: Mapping): ((v: Json) => Json) | undefined {
   const t = m.translate;
-  if (!t || (t.pairs.length === 0 && t.otherwise === "keep")) return undefined;
-  return (v) => translateValue(v, t);
+  const translate = t && !(t.pairs.length === 0 && t.otherwise === "keep") ? (v: Json) => translateValue(v, t) : undefined;
+  const steps = m.steps?.length ? m.steps : undefined;
+  if (!translate && !steps) return undefined;
+  // Steps first (e.g. trim, upper case), then the translation table.
+  return (v) => {
+    const stepped = steps ? applySteps(v, steps) : v;
+    return translate ? translate(stepped) : stepped;
+  };
 }
 
 /** Constant values by key, to read constant mappings from (see applyWithHeaders). */

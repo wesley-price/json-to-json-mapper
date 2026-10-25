@@ -22,7 +22,7 @@ const implCheck = (m: WithImpl) => m.readiness.find((r) => r.id === "implementat
 import { testCasesFile } from "./test-cases";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { formatInfo } from "@/lib/formats";
-import { type Path, pathId } from "@/lib/json-tree";
+import { type Path, pathId, rowPath } from "@/lib/json-tree";
 import { isConstPath } from "@/lib/transforms";
 import { MappingDiagram, constantRow, excerptRows, excerptRowsMany, rowsFor } from "./MappingDiagram";
 import {
@@ -84,7 +84,7 @@ function SingleCard({ m, report, prefix }: { m: ReportMapping; report: ReportMod
         diagramId={prefix + m.id}
         source={m.constant !== undefined ? [constantRow(m.from, m.constant, m.db)] : excerptRows(report.src.tree, m.from)}
         target={excerptRows(report.dst.tree, m.to)}
-        links={[{ from: pathId(m.from), to: pathId(m.to), color: m.color }]}
+        links={[{ from: pathId(rowPath(m.from)), to: pathId(m.to), color: m.color }]}
         sourceTitle={report.sourceTitle}
         targetTitle={report.targetTitle}
       />
@@ -137,7 +137,7 @@ function CombinedCard({ c, report, prefix }: { c: ReportCombined; report: Report
           ...c.parts.filter((p) => p.constant !== undefined).map((p) => constantRow(p.from, p.constant, p.db)),
         ]}
         target={excerptRows(report.dst.tree, c.to)}
-        links={c.parts.map((p) => ({ from: pathId(p.from), to: pathId(c.to), color: p.color }))}
+        links={c.parts.map((p) => ({ from: pathId(rowPath(p.from)), to: pathId(c.to), color: p.color }))}
         sourceTitle={report.sourceTitle}
         targetTitle={report.targetTitle}
       />

@@ -18,6 +18,8 @@ interface Props {
   onExport: () => void;
   exportDisabled: boolean;
   onImport: () => void;
+  onImportOpenApi: () => void;
+  onExportOpenApi: (format: "yaml" | "json") => void;
   onLoadExample: (source: Format, target: Format) => void;
   onClear: () => void;
   /** Multi-source mode: one standard (primary) object fed by several sources. */
@@ -173,6 +175,15 @@ export function AppMenu(props: Props) {
             </Item>
             <Item onClick={act(props.onImport)}>
               ⬆ Import from Excel…
+            </Item>
+            <Item onClick={act(() => props.onExportOpenApi("yaml"))} disabled={props.exportDisabled}>
+              ⬇ Export to OpenAPI (.yaml)
+            </Item>
+            <Item onClick={act(() => props.onExportOpenApi("json"))} disabled={props.exportDisabled}>
+              ⬇ Export to OpenAPI (.json)
+            </Item>
+            <Item onClick={act(props.onImportOpenApi)}>
+              ⬆ Import from OpenAPI…
             </Item>
           </Group>
 

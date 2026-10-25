@@ -4,7 +4,7 @@
 // prints crisply and always fits.
 
 import { HEADERS } from "@/lib/headers";
-import { ARRAY_ITEM, type FieldNode, type FieldType, type Path, findNode, pathId } from "@/lib/json-tree";
+import { ARRAY_ITEM, type FieldNode, type FieldType, type Path, findNode, pathId, rowPath } from "@/lib/json-tree";
 
 export interface DiagramRow {
   id: string; // pathId, or a unique id for "… more" rows
@@ -73,7 +73,8 @@ export function allRows(root: FieldNode): DiagramRow[] {
 }
 
 /** A close-up around one field: its ancestors, a few neighbours, and the field itself. */
-export function excerptRows(root: FieldNode, path: Path, neighbours = 2): DiagramRow[] {
+export function excerptRows(root: FieldNode, selectorPath: Path, neighbours = 2): DiagramRow[] {
+  const path = rowPath(selectorPath);
   const out: DiagramRow[] = [];
   for (let k = 1; k < path.length; k++) {
     const ancestor = findNode(root, path.slice(0, k));
@@ -220,7 +221,8 @@ export function MappingDiagram({
 }
 
 /** A close-up around several fields at once: each field plus its parents, in tree order. */
-export function excerptRowsMany(root: FieldNode, paths: Path[]): DiagramRow[] {
+export function excerptRowsMany(root: FieldNode, selectorPaths: Path[]): DiagramRow[] {
+  const paths = selectorPaths.map(rowPath);
   const keep = new Set<string>();
   for (const p of paths) for (let k = 1; k <= p.length; k++) keep.add(pathId(p.slice(0, k)));
   return allRows(root).filter((row) => keep.has(row.id));

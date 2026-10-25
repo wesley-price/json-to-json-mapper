@@ -3,6 +3,7 @@
 // "every element of this array".
 
 import type { DbRef, Translation } from "./transforms";
+import type { Step } from "./steps";
 
 export type Json =
   | string
@@ -33,6 +34,8 @@ export interface Mapping {
   db?: DbRef;
   /** Value translation table applied on the way through. */
   translate?: Translation;
+  /** Value transformations (dates, text, numbers…), run before the translation table. */
+  steps?: Step[];
   /** Free text for whoever implements the mapping (business rules, open questions). */
   note?: string;
 }
@@ -58,10 +61,45 @@ export interface FieldNode {
 
 export const pathId = (path: Path) => JSON.stringify(path);
 
+/**
+ * List selection: a source path segment that picks one item of a list instead of
+ * walking every item — "[first]", "[last]", "[#3]" (the third) or
+ * "[where type = billing]" (the first item whose field matches; "!=" and "~"
+ * (contains) work too).
+ */
+export const isSelector = (seg: string) => seg !== ARRAY_ITEM && seg.length > 2 && seg.startsWith("[") && seg.endsWith("]");
+
+/** The tree row a path belongs to (selectors become "[]"). */
+export const rowPath = (path: Path): Path => (path.some(isSelector) ? path.map((s) => (isSelector(s) ? ARRAY_ITEM : s)) : path);
+
+/** The item(s) of a list a selector picks. */
+export function selectItems(list: Json[], seg: string): Json[] {
+  const body = seg.slice(1, -1).trim();
+  if (body === "first") return list.length ? [list[0]] : [];
+  if (body === "last") return list.length ? [list[list.length - 1]] : [];
+  if (body.startsWith("#")) {
+    const n = Number(body.slice(1));
+    return Number.isInteger(n) && n >= 1 && n <= list.length ? [list[n - 1]] : [];
+  }
+  const m = /^where\s+(.+?)\s*(!=|=|~)\s*(.*)$/.exec(body);
+  if (!m) return [];
+  const [, field, op, raw] = m;
+  const want = raw.trim().replace(/^["']|["']$/g, "").toLowerCase();
+  const hit = list.find((item) => {
+    let v: Json | undefined = item;
+    for (const key of field.split(".")) v = isObject(v) ? v[key] : undefined;
+    const text = v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+    const t = text.toLowerCase();
+    return op === "=" ? t === want : op === "!=" ? t !== want : t.includes(want);
+  });
+  return hit === undefined ? [] : [hit];
+}
+
 export function pathLabel(path: Path): string {
   if (path.length === 0) return "(root)";
   return path.reduce((out, seg) => {
     if (seg === ARRAY_ITEM) return out + "[]";
+    if (isSelector(seg)) return out + seg;
     const safe = /^[A-Za-z_$][\w$]*$/.test(seg) ? seg : JSON.stringify(seg);
     if (!out) return safe;
     return /^[A-Za-z_$]/.test(safe) ? `${out}.${safe}` : `${out}[${safe}]`;
@@ -238,6 +276,8 @@ interface Match {
 function collect(value: Json, path: Path, indexes: number[] = []): Match[] {
   if (path.length === 0) return [{ indexes, value }];
   const [head, ...rest] = path;
+  // A selector picks item(s) without adding a list index: the value counts as a single value.
+  if (isSelector(head)) return Array.isArray(value) ? selectItems(value, head).flatMap((item) => collect(item, rest, indexes)) : [];
   if (head === ARRAY_ITEM) {
     if (!Array.isArray(value)) return [];
     return value.flatMap((item, i) => collect(item, rest, [...indexes, i]));
@@ -287,6 +327,37 @@ export const DEFAULT_JOIN = " ";
 /** A value as text for joining; null/missing is empty. */
 const joinText = (v: Json | undefined) =>
   v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
+/** How combined fields can be put together: text joins, or a number worked out from the parts. */
+export const COMBINE_MODES = [
+  { id: "join", label: "Join as text" },
+  { id: "[sum]", label: "Sum" },
+  { id: "[product]", label: "Multiply" },
+  { id: "[decimal]", label: "Decimal (amount + decimal places)" },
+] as const;
+export const isNumericCombine = (sep: string | undefined) => sep === "[sum]" || sep === "[product]" || sep === "[decimal]";
+
+/**
+ * Combine the parts of a combined field. The separator is either text to join
+ * with, or one of "[sum]", "[product]", "[decimal]" (the first part divided by
+ * 10 to the power of the second, e.g. 2548 and 2 -> 25.48).
+ */
+export function combineParts(parts: (Json | undefined)[], sep: string): Json {
+  if (sep === "[sum]" || sep === "[product]" || sep === "[decimal]") {
+    const nums = parts.map((p) => (p === undefined || p === null || p === "" || typeof p === "object" ? NaN : Number(p)));
+    const tidy = (n: number) => Number(n.toFixed(10));
+    if (sep === "[decimal]") {
+      const [amount, places] = nums;
+      if (Number.isNaN(amount)) return parts[0] === undefined ? null : parts[0];
+      const p = Number.isNaN(places) ? 0 : Math.trunc(places);
+      return p >= 0 ? Number((amount / Math.pow(10, p)).toFixed(p)) : tidy(amount * Math.pow(10, -p));
+    }
+    const valid = nums.filter((n) => !Number.isNaN(n));
+    if (!valid.length) return null;
+    return tidy(sep === "[sum]" ? valid.reduce((a, b) => a + b, 0) : valid.reduce((a, b) => a * b, 1));
+  }
+  return parts.map(joinText).filter((t) => t !== "").join(sep);
+}
 
 /** True when `a` is a prefix of `b` (array indexes). */
 const indexPrefix = (a: number[], b: number[]) => a.length <= b.length && a.every((n, i) => b[i] === n);
@@ -364,7 +435,7 @@ export function applyMappings(
           set.find((m) => indexPrefix(m.indexes, lead.indexes)) ?? set.find((m) => indexPrefix(lead.indexes, m.indexes));
         return match?.value;
       });
-      const joined = parts.map(joinText).filter((t) => t !== "").join(sep);
+      const joined = combineParts(parts, sep);
       result = assign(result, u.to, lead.indexes, joined, templates);
     }
   }
@@ -421,8 +492,13 @@ export function parsePathLabel(label: string): (string | number)[] {
     const ch = s[i];
     if (ch === "[") {
       i++;
+      const rest = s.slice(i, s.indexOf("]", i));
       if (s[i] === "]") {
         out.push(ARRAY_ITEM);
+      } else if (/^(first|last|#\d+|where\s)/.test(rest)) {
+        // A list selector: kept as one segment.
+        out.push(`[${rest}]`);
+        i += rest.length;
       } else if (s[i] === '"') {
         out.push(readQuoted());
       } else {

@@ -18,8 +18,7 @@ import {
   DEFAULT_JOIN,
   joinsFor,
   pathId,
-  pathLabel,
-} from "@/lib/json-tree";
+  pathLabel, rowPath } from "@/lib/json-tree";
 import type { DiagramLink } from "./MappingDiagram";
 import {
   CONST,
@@ -37,6 +36,7 @@ import { type Headers, applyWithHeaders, headersText, lookupTree, supportsHeader
 import { type FieldDecisions, type FieldQuestions, type Spec, UNMAPPED_OPTIONS, applyRules, normalizeSpec, unmappedFields } from "@/lib/spec";
 import { type TestCase, numberCases, someHeaders } from "./test-cases";
 import { dbConstantsOf, readinessOf } from "@/lib/readiness";
+import { describeSteps } from "@/lib/steps";
 
 export const STORAGE_KEY = "object-mapper:v1";
 const COLORS = ["#2563eb", "#db2777", "#16a34a", "#ea580c", "#7c3aed", "#0891b2", "#ca8a04", "#dc2626"];
@@ -240,6 +240,7 @@ export function buildReport(saved: Saved | null) {
                 : "A fixed value (constant), not read from the source.",
             ]
           : []),
+        ...(mapping.steps?.length ? [`Transformed: ${describeSteps(mapping.steps)}.`] : []),
         ...(mapping.translate ? [`Values translated: ${describeTranslation(mapping.translate)}.`] : []),
         ...(mapping.note?.trim() ? [`Note: ${mapping.note.trim()}`] : []),
       ];
@@ -315,8 +316,8 @@ export function buildReport(saved: Saved | null) {
   const targetLeaves = leafPaths(dstTree);
   const covered = (p: Path) => pairs.some((m) => isPrefix(m.to, p));
   const links: DiagramLink[] = [
-    ...pairs.filter((m) => !(pathId(m.to) in targetTags)).map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color })),
-    ...singles.filter((m) => m.id.startsWith("tag:")).map((m) => ({ from: pathId(m.from), to: pathId(m.to), color: m.color })),
+    ...pairs.filter((m) => !(pathId(m.to) in targetTags)).map((m) => ({ from: pathId(rowPath(m.from)), to: pathId(m.to), color: m.color })),
+    ...singles.filter((m) => m.id.startsWith("tag:")).map((m) => ({ from: pathId(rowPath(m.from)), to: pathId(m.to), color: m.color })),
   ];
 
   return {
@@ -379,6 +380,9 @@ export function buildReport(saved: Saved | null) {
 
 /** Separator shown in words: " " -> "a space". */
 export function describeJoin(join: string): string {
+  if (join === "[sum]") return "a sum (the parts added up)";
+  if (join === "[product]") return "a product (the parts multiplied)";
+  if (join === "[decimal]") return "a decimal (the first part divided by 10 to the power of the second)";
   if (join === "") return "nothing";
   if (join === " ") return "a space";
   return JSON.stringify(join);

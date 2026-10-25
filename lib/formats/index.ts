@@ -5,11 +5,12 @@ import { parseCsv, toCsv } from "./csv";
 import { type FlatLayout, defaultFlatLayout, parseFlat, toFlat } from "./flat";
 import { avroFieldTypes, parseAvro, toAvro } from "./avro";
 import { kafkaFieldTypes, parseKafka, toKafka } from "./kafka";
+import { jsonSchemaFieldTypes, parseJsonSchema, toJsonSchema } from "./jsonschema";
 import { declaredTypes, parseTable, toTable } from "./table";
 import { parseXml, toXml } from "./xml";
 import { bigNumberNote, parseJsonLossless } from "./lossless";
 
-export type Format = "json" | "xml" | "csv" | "flat" | "table" | "avro" | "kafka";
+export type Format = "json" | "xml" | "csv" | "flat" | "table" | "avro" | "kafka" | "jsonschema";
 
 export const FORMATS: { id: Format; label: string; extension: string; mime: string }[] = [
   { id: "json", label: "JSON", extension: "json", mime: "application/json" },
@@ -19,6 +20,7 @@ export const FORMATS: { id: Format; label: string; extension: string; mime: stri
   { id: "table", label: "Table (SQL)", extension: "sql", mime: "application/sql" },
   { id: "avro", label: "Avro schema", extension: "avsc", mime: "application/json" },
   { id: "kafka", label: "Kafka event", extension: "json", mime: "application/json" },
+  { id: "jsonschema", label: "JSON Schema", extension: "json", mime: "application/schema+json" },
 ];
 
 export const formatInfo = (format: Format) => FORMATS.find((f) => f.id === format) ?? FORMATS[0];
@@ -33,6 +35,8 @@ export const PLACEHOLDERS: Record<Format, string> = {
   avro: '{\n  "type": "record",\n  "name": "OrderPlaced",\n  "fields": [\n    { "name": "orderId", "type": "string" },\n    { "name": "note", "type": ["null", "string"], "default": null }\n  ]\n}',
   kafka:
     '{\n  "topic": "orders",\n  "key": "A-1001",\n  "headers": { "event-type": "OrderPlaced" },\n  "value": { "orderId": "A-1001", "total": 25.48 }\n}\n\n(or just the payload; "value" can also be an Avro schema)',
+  jsonschema:
+    '{\n  "type": "object",\n  "required": ["orderId"],\n  "properties": {\n    "orderId": { "type": "string" },\n    "placedAt": { "type": "string", "format": "date-time" }\n  }\n}\n\n(JSON or YAML; ☰ Menu → Import from OpenAPI picks schemas from an API spec)',
 };
 
 export interface ReadResult {
@@ -49,6 +53,7 @@ export function readFormat(format: Format, text: string, layout: FlatLayout = de
   if (format === "table") return { data: parseTable(text, notes), warnings: notes };
   if (format === "avro") return { data: parseAvro(text, notes), warnings: notes };
   if (format === "kafka") return { data: parseKafka(text, notes), warnings: notes };
+  if (format === "jsonschema") return { data: parseJsonSchema(text, notes), warnings: notes };
   const { value: data, big } = parseJsonLossless(text);
   if (typeof data !== "object" || data === null) throw new Error("Top level must be an object or array.");
   return { data, warnings: big.map(bigNumberNote) };
@@ -62,6 +67,7 @@ export function writeFormat(format: Format, data: Json, layout: FlatLayout = def
   if (format === "table") return toTable(data, like);
   if (format === "avro") return toAvro(data, like);
   if (format === "kafka") return toKafka(data, like);
+  if (format === "jsonschema") return toJsonSchema(data, like);
   return JSON.stringify(data, null, 2);
 }
 
@@ -74,6 +80,7 @@ export function schemaTypes(format: Format, text: string | undefined): Map<strin
   if (!text) return new Map();
   if (format === "avro") return avroFieldTypes(text);
   if (format === "kafka") return kafkaFieldTypes(text);
+  if (format === "jsonschema") return jsonSchemaFieldTypes(text);
   if (format === "table") {
     const out = new Map<string, string>();
     for (const [key, type] of declaredTypes(text)) {

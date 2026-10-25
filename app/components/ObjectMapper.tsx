@@ -23,6 +23,11 @@ import {
   pathId,
   parsePathLabel,
   pathLabel,
+  rowPath,
+  COMBINE_MODES,
+  isNumericCombine,
+  combineParts,
+  isSelector,
   removeField,
   renameField,
   setArrayItemType,
@@ -41,7 +46,8 @@ import {
   readFormat,
   writeFormat,
 } from "@/lib/formats";
-import { SECTIONS, type SectionName, guessDelimiter, syncLayoutFields } from "@/lib/formats/flat";
+import { SECTIONS, type SectionName, detectLayout, layoutFits, layoutRenames, strayFields, syncLayoutFields, wrapInSection } from "@/lib/formats/flat";
+import { inferScalar } from "@/lib/formats/xml";
 import { EXAMPLES, MERGE_EXAMPLE, MERGE_STANDARD, MULTI_EXAMPLE, STANDARD_ERROR } from "@/lib/examples";
 import { DEFAULT_DOC_NAME, fileSlug } from "@/lib/names";
 import {
@@ -57,6 +63,12 @@ import { MultiBar } from "./MultiBar";
 import { type ReusableObject, ScenarioBar } from "./ScenarioBar";
 import { type ExampleField, type ExampleOutcome, SourceExamples } from "./SourceExamples";
 import { SpecDialog } from "./SpecDialog";
+import { StepsEditor } from "./StepsEditor";
+import { OpenApiDialog } from "./OpenApiDialog";
+import { type ApiSchemaEntry, type FieldMappingNote, type OpenApiScenario, buildOpenApi, bundleSchema } from "@/lib/openapi";
+import { parseJsonOrYaml, schemaIn, toJsonSchema, validateJsonSchema } from "@/lib/formats/jsonschema";
+import { describeJoin } from "./report/model";
+import { type Step, describeSteps } from "@/lib/steps";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { Icon } from "./Icon";
 import { dbConstantsOf, readinessOf } from "@/lib/readiness";
@@ -80,6 +92,7 @@ import {
   HEADERS,
   type Headers,
   applyWithHeaders,
+  headersText,
   headersTree,
   isHeaderPath,
   lookupTree,
@@ -101,6 +114,7 @@ import {
   normalizeSpec,
   readSpec,
   specRows,
+  UNMAPPED_SHORT,
   unmappedFields,
 } from "@/lib/spec";
 import { buildScenariosWorkbook, isScenariosWorkbook, parseScenariosWorkbook } from "@/lib/scenario-workbook";
@@ -182,6 +196,8 @@ interface SideState {
   decisions?: FieldDecisions;
   /** Open questions for fields marked "ask" (pathId -> question / who to ask). */
   questions?: FieldQuestions;
+  /** The API operation this object's schema was imported from (OpenAPI), so the export can put it back there. */
+  apiOrigin?: { method?: string; path?: string; status?: string };
 }
 
 interface Selection {
@@ -364,8 +380,8 @@ function coverageOf({ sides, primary, multi }: Work, sources: SourceState[]) {
           : c.mappings
           .filter((m) => isPrefix(m[primary], path))
           .map((m) => {
-            const tag = src.side.fixed?.[pathId(m[secondary])];
-            return sourceLabel(m, secondary) + (tag ? ` 📌 ${describeFixed(tag)}` : "") + (m.translate ? " ⇄" : "");
+            const tag = src.side.fixed?.[pathId(rowPath(m[secondary]))];
+            return sourceLabel(m, secondary) + (tag ? ` 📌 ${describeFixed(tag)}` : "") + (m.steps?.length ? " ƒ" : "") + (m.translate ? " ⇄" : "");
           }),
       })),
     ),
@@ -458,6 +474,7 @@ function multiDocOf({ sides, primary, multi }: Work, sources: SourceState[], doc
           ...(m.constant !== undefined ? { constant: m.constant } : {}),
           ...(m.db ? { db: m.db } : {}),
           ...(m.translate ? { translate: m.translate } : {}),
+          ...(m.steps?.length ? { steps: m.steps } : {}),
         })),
       })),
     })),
@@ -479,6 +496,7 @@ function withSpec(
     ([, st]) =>
       (st.format === "table" && /create\s+table/i.test(st.text)) ||
       (st.format === "avro" && st.text.trim().startsWith("{")) ||
+      (st.format === "jsonschema" && st.text.trim() !== "") ||
       (st.format === "kafka" && schemaTypes("kafka", st.text).size > 0),
   );
   // Long definitions continue on following rows with the same object (Excel caps a cell at 32,767 characters).
@@ -553,7 +571,7 @@ function applyStash(multi: MultiState, stash: Stash | null): MultiState {
 
 /** A table / Avro side's text rebuilt with its declared types (from the "Schemas" sheet; older workbooks: "Table definitions"). */
 function withTableDef(side: SideState, sheets: Sheet[], object: string): SideState {
-  if (!["table", "avro", "kafka"].includes(side.format) || side.data === null) return side;
+  if (!["table", "avro", "kafka", "jsonschema"].includes(side.format) || side.data === null) return side;
   const def = (sheets.find((x) => ["schemas", "table definitions"].includes(x.name.toLowerCase()))?.rows.slice(1) ?? [])
     .filter((r) => String(r[0] ?? "").trim().toLowerCase() === object.toLowerCase())
     .map((r) => String(r[1] ?? ""))
@@ -594,6 +612,78 @@ function readDecisions(sheets: Sheet[], object: string): FieldDecisions {
 }
 
 /** A scenario's own workbook: multi-source or single pair. */
+/** A side's JSON Schema: the declared one (JSON Schema format), else one inferred from its data. */
+function schemaOfSide(side: SideState): Record<string, unknown> {
+  if (side.format === "jsonschema" && side.text.trim()) {
+    try {
+      const s = schemaIn(parseJsonOrYaml(side.text));
+      if (typeof s === "object" && s !== null && !Array.isArray(s)) return bundleSchema(s, s);
+    } catch {
+      // not readable; infer from the data instead
+    }
+  }
+  if (side.data === null) return {};
+  return (JSON.parse(toJsonSchema(side.data)) as { schema: Record<string, unknown> }).schema;
+}
+
+/** One scenario as the OpenAPI export sees it: the target schema, how each target field is filled, and the sources. */
+function openApiScenarioOf(sc: Work & { name: string }, spec: Spec): OpenApiScenario | null {
+  const sourceSide: Side = sc.multi.enabled ? other(sc.primary) : sc.primary;
+  const targetSide = other(sourceSide);
+  const target = sc.sides[targetSide];
+  if (target.data === null) return null;
+  const fields = new Map<string, FieldMappingNote[]>();
+  const push = (id: string, n: FieldMappingNote) => fields.set(id, [...(fields.get(id) ?? []), n]);
+  const sources = sc.multi.enabled
+    ? foldSources(sc).map((s) => ({ name: s.name, side: s.side, cases: s.cases.map((c) => ({ name: c.name, mappings: c.mappings })) }))
+    : [{ name: sc.sides[sourceSide].name?.trim() || "Source", side: sc.sides[sourceSide], cases: [{ name: "", mappings: sc.mappings }] }];
+  const several = sources.length > 1;
+  const targets: Path[] = [];
+  for (const src of sources) {
+    for (const kase of src.cases) {
+      const groups = new Map<string, Mapping[]>();
+      for (const m of kase.mappings) {
+        const to = rowPath(m[targetSide]);
+        targets.push(to);
+        groups.set(pathId(to), [...(groups.get(pathId(to)) ?? []), m]);
+      }
+      for (const [id, ms] of groups) {
+        const label = (m: Mapping) => {
+          if (isConstPath(m[sourceSide])) return sourceLabel(m, sourceSide);
+          const tag = src.side.fixed?.[pathId(rowPath(m[sourceSide]))];
+          return `${several ? `${src.name}: ` : ""}${pathLabel(m[sourceSide])}${tag ? ` (constant ${describeFixed(tag)})` : ""}`;
+        };
+        const allConst = ms.every((m) => isConstPath(m[sourceSide]));
+        const steps = ms.map((m) => describeSteps(m.steps)).filter(Boolean).join("; ");
+        const translate = ms.filter((m) => m.translate).map((m) => describeTranslation(m.translate!)).join("; ");
+        const note = ms.map((m) => m.note?.trim() ?? "").filter(Boolean).join(" ");
+        push(id, {
+          from: allConst && ms.length === 1 ? [] : ms.map(label),
+          ...(allConst && ms.length === 1 ? { constant: sourceLabel(ms[0], sourceSide).replace(/ \(constant\)$/, "") } : {}),
+          ...(ms.length > 1 ? { combine: describeJoin(ms[0].join ?? " ") } : {}),
+          ...(steps ? { steps } : {}),
+          ...(translate ? { translate } : {}),
+          ...(src.cases.length > 1 ? { case: `${several ? `${src.name} › ` : ""}${kase.name}` } : several ? { case: src.name } : {}),
+          ...(note ? { note } : {}),
+        });
+      }
+    }
+  }
+  for (const [id, f] of Object.entries(target.fixed ?? {})) push(id, { from: [], constant: describeFixed(f) });
+  const unmapped = new Map<string, string>();
+  for (const u of unmappedFields(lookupTree(target.data, activeHeaders(target)), targets, target.fixed, target.decisions, spec, target.questions)) {
+    unmapped.set(pathId(u.path), UNMAPPED_SHORT[u.effective] + (u.question ? `: ${u.question}` : ""));
+  }
+  return {
+    name: sc.name,
+    targetSchema: schemaOfSide(target),
+    fields,
+    unmapped,
+    sources: sources.map((s) => ({ name: s.name, schema: schemaOfSide(s.side), ...(s.side.apiOrigin ? { origin: s.side.apiOrigin } : {}) })),
+    ...(target.apiOrigin ? { origin: target.apiOrigin } : {}),
+  };
+}
+
 function workbookOf(w: Work, docName: string, spec: Spec): Sheet[] {
   const stash = stashOf(w);
   const sheets = workbookSheets(w, docName, spec);
@@ -711,6 +801,7 @@ function scenarioFromSheets(sheets: Sheet[], name: string): { sc: ScenarioState;
             ...(m.constant !== undefined ? { constant: m.constant } : {}),
             ...(m.db ? { db: m.db } : {}),
             ...(m.translate ? { translate: m.translate } : {}),
+            ...(m.steps?.length ? { steps: m.steps } : {}),
           }),
         ),
       }));
@@ -806,6 +897,10 @@ export default function ObjectMapper() {
   // Field search, per side.
   const [search, setSearch] = useState<Record<Side, string>>({ left: "", right: "" });
   const [canvasView, setCanvasView] = useStoredFlag(CANVAS_VIEW_KEY);
+  // Per panel: the field tree (default) or the object as it really looks, read-only.
+  const [objectView, setObjectView] = useState<Record<Side, boolean>>({ left: false, right: false });
+  // The target's object view: its template, or what the mapping produces.
+  const [objectAfter, setObjectAfter] = useState(true);
   const [multiCollapsed, setMultiCollapsed] = useStoredFlag(MULTI_COLLAPSED_KEY);
   // Scenarios: the active one is live in the state above; the others are stored here.
   // (Empty until a second scenario is added: the live state is then the only scenario.)
@@ -1152,7 +1247,7 @@ export default function ObjectMapper() {
       setSides((s) => {
         const cur = s[side];
         if (data === null) return { ...s, [side]: { ...cur, data } };
-        const layout = cur.format === "flat" ? syncLayoutFields(cur.layout, data) : cur.layout;
+        const layout = cur.format === "flat" ? syncLayoutFields(cur.layout, data, keepText) : cur.layout;
         const text = keepText ? cur.text : writeFormat(cur.format, data, layout, cur.text);
         const stillThere = (p: Path) => isHeaderPath(p) || valid.has(pathId(p));
         const fixed = keepFixed(cur.fixed, stillThere, movePath);
@@ -1162,7 +1257,7 @@ export default function ObjectMapper() {
         return { ...s, [side]: { ...cur, data, layout, text, fixed, moreValues, decisions, questions } };
       });
       // Body edits never touch header fields, so their mappings stay.
-      const keep = (p: Path) => isHeaderPath(p) || isConstPath(p) || valid.has(pathId(p));
+      const keep = (p: Path) => isHeaderPath(p) || isConstPath(p) || valid.has(pathId(rowPath(p)));
       setMappings((ms) => ms.map((m) => (rewrite ? rewrite(m) : m)).filter((m) => keep(m[side])));
       setSelected((sel) => (sel && sel.side === side && !keep(sel.path) ? null : sel));
     },
@@ -1192,7 +1287,14 @@ export default function ObjectMapper() {
   );
 
   /** Read a side's text with its format (and flat layout). */
-  const readSide = (side: Side, layout: FlatLayout) => {
+  const readSide = (
+    side: Side,
+    layout: FlatLayout,
+    /** A flat layout's field renames, so mappings and tags follow them. */
+    move?: (p: Path) => Path,
+    /** Live re-reads from the layout editor show their own warnings. */
+    quiet = false,
+  ) => {
     const st = sides[side];
     const text = st.text.trim();
     if (!text) {
@@ -1203,8 +1305,8 @@ export default function ObjectMapper() {
       const { data, warnings } = readFormat(st.format, text, layout);
       setSides((s) => ({ ...s, [side]: { ...s[side], layout, error: null, editingText: false } }));
       // Keep the pasted text as-is rather than re-printing it.
-      commitData(side, data, undefined, true);
-      if (warnings.length) {
+      commitData(side, data, move ? (m) => ({ ...m, [side]: move(m[side]) }) : undefined, true, move);
+      if (warnings.length && !quiet) {
         setNotice({ kind: "ok", text: `Read the ${side} file.`, details: warnings, label: "Please check:" });
       }
     } catch (e) {
@@ -1215,9 +1317,11 @@ export default function ObjectMapper() {
   const loadText = (side: Side) => {
     const st = sides[side];
     let layout = st.layout;
-    // First read of a flat file: guess how its fields are separated.
-    if (st.format === "flat" && SECTIONS.every((n) => layout[n].fields.length === 0)) {
-      layout = { ...layout, delimiter: guessDelimiter(st.text.trim()) };
+    // A flat file: guess its separator and record codes on the first read, or when
+    // a different file is pasted that the current layout doesn't fit (names start afresh).
+    if (st.format === "flat") {
+      if (SECTIONS.every((n) => layout[n].fields.length === 0)) layout = detectLayout(st.text.trim(), layout);
+      else if (!layoutFits(st.text.trim(), layout)) layout = detectLayout(st.text.trim(), defaultFlatLayout());
     }
     readSide(side, layout);
   };
@@ -1233,8 +1337,8 @@ export default function ObjectMapper() {
   /** New flat layout: the source file is re-read with it; the target file is re-written with it. */
   const applyLayout = (side: Side, layout: FlatLayout) => {
     const st = sides[side];
-    if (side === primary && st.text.trim()) {
-      readSide(side, layout);
+    if (side === sourceSide && st.text.trim()) {
+      readSide(side, layout, layoutRenames(st.layout, layout), true);
       return;
     }
     setSides((s) => {
@@ -1242,6 +1346,25 @@ export default function ObjectMapper() {
       const text = cur.data === null ? cur.text : writeFormat(cur.format, cur.data, layout, cur.text);
       return { ...s, [side]: { ...cur, layout, text } };
     });
+  };
+
+  /** Put a side's top-level fields into a flat file's body or header (mappings and tags follow). */
+  const moveIntoSection = (side: Side, into: "body" | "header") => {
+    const data = sides[side].data;
+    if (data === null) return;
+    const { data: next, move } = wrapInSection(data, into);
+    const follow = (p: Path) => (isHeaderPath(p) || isConstPath(p) ? p : move(p));
+    // Sections still empty are switched off, so the file has no blank header / footer line.
+    const has = (name: SectionName) => {
+      const v = (next as Record<string, Json>)[name];
+      const first = Array.isArray(v) ? v[0] : v;
+      return typeof first === "object" && first !== null && Object.keys(first).length > 0;
+    };
+    setSides((s) => {
+      const lay = s[side].layout;
+      return { ...s, [side]: { ...s[side], layout: { ...lay, header: { ...lay.header, enabled: has("header") }, body: { ...lay.body, enabled: true }, footer: { ...lay.footer, enabled: has("footer") } } } };
+    });
+    commitData(side, next, (m) => ({ ...m, [side]: follow(m[side]) }), false, follow);
   };
 
   /** Give a target object the header / body / footer fields a flat file is written from. */
@@ -1293,7 +1416,7 @@ export default function ObjectMapper() {
     (left: Path, right: Path, mode: "combine" | "replace", constant?: Json, db?: DbRef) =>
       setMappings((ms) => {
         const target = targetSide === "left" ? left : right;
-        const sameTarget = (m: Mapping) => pathId(m[targetSide]) === pathId(target);
+        const sameTarget = (m: Mapping) => pathId(rowPath(m[targetSide])) === pathId(target);
         const extra = constant !== undefined ? { constant, ...(db ? { db } : {}) } : {};
         if (mode === "replace") return [...ms.filter((m) => !sameTarget(m)), { id: newId(), left, right, ...extra }];
         const join = ms.find(sameTarget)?.join;
@@ -1310,8 +1433,8 @@ export default function ObjectMapper() {
       if (left.length === 0 || right.length === 0) return;
       const source = sourceSide === "left" ? left : right;
       const target = targetSide === "left" ? left : right;
-      const existing = mappings.filter((m) => pathId(m[targetSide]) === pathId(target));
-      if (existing.some((m) => pathId(m[sourceSide]) === pathId(source))) return; // already mapped
+      const existing = mappings.filter((m) => pathId(rowPath(m[targetSide])) === pathId(target));
+      if (existing.some((m) => pathId(rowPath(m[sourceSide])) === pathId(source))) return; // already mapped
       if (sides[targetSide].fixed?.[pathId(target)] !== undefined) {
         setNotice({
           kind: "error",
@@ -1368,7 +1491,7 @@ export default function ObjectMapper() {
 
   /** Remove every mapping that uses this field. */
   const unmapField = (side: Side, path: Path) =>
-    removeMappings(mappings.filter((m) => pathId(m[side]) === pathId(path)).map((m) => m.id));
+    removeMappings(mappings.filter((m) => pathId(rowPath(m[side])) === pathId(path)).map((m) => m.id));
 
   /** Hovering a field spotlights its mappings, including those of anything inside it. */
   const hoverField = (side: Side, path: Path | null) => {
@@ -1686,7 +1809,7 @@ export default function ObjectMapper() {
     const value = st.data === null ? "" : (valuesAtPath(st.data, activeHeaders(st), path)[0] ?? "");
     setFixed(side, path, { value });
     if (side === targetSide) {
-      const ids = mappings.filter((m) => pathId(m[targetSide]) === key).map((m) => m.id);
+      const ids = mappings.filter((m) => pathId(rowPath(m[targetSide])) === key).map((m) => m.id);
       if (ids.length) removeMappings(ids);
     }
   };
@@ -1819,7 +1942,7 @@ export default function ObjectMapper() {
   /** Add a fixed value to a target field (asks to combine/replace if the field is already mapped). */
   const addConstant = (target: Path, c: { value: Json; db?: DbRef }) => {
     const pair = { [sourceSide]: newConstPath(), [targetSide]: target } as { left: Path; right: Path };
-    if (mappings.some((m) => pathId(m[targetSide]) === pathId(target))) setPendingCombine({ ...pair, constant: c.value, db: c.db });
+    if (mappings.some((m) => pathId(rowPath(m[targetSide])) === pathId(target))) setPendingCombine({ ...pair, constant: c.value, db: c.db });
     else addMapping(pair.left, pair.right, "replace", c.value, c.db);
   };
   const setConstant = (id: string, c: { value: Json; db?: DbRef }) =>
@@ -1838,6 +1961,15 @@ export default function ObjectMapper() {
         const { translate: _drop, ...rest } = m;
         void _drop;
         return t ? { ...rest, translate: t } : rest;
+      }),
+    );
+  const setSteps = (id: string, steps: Step[]) =>
+    setMappings((ms) =>
+      ms.map((m) => {
+        if (m.id !== id) return m;
+        const { steps: _old, ...rest } = m;
+        void _old;
+        return steps.length ? { ...rest, steps } : rest;
       }),
     );
   const setNote = (id: string, note: string) =>
@@ -1861,7 +1993,7 @@ export default function ObjectMapper() {
 
   /** Set the separator for every mapping into the target `targetId`. */
   const setJoin = (targetId: string, join: string) =>
-    setMappings((ms) => ms.map((m) => (pathId(m[targetSide]) === targetId ? { ...m, join } : m)));
+    setMappings((ms) => ms.map((m) => (pathId(rowPath(m[targetSide])) === targetId ? { ...m, join } : m)));
 
   /** Move a mapping up/down among the mappings that share its target (the join order). */
   const moveInGroup = (id: string, dir: -1 | 1) =>
@@ -1919,8 +2051,8 @@ export default function ObjectMapper() {
       if (kase) caseOf[src.id] = kase.id;
       const fields = canvasFields(lookupTree(src.side.data, headers));
       for (const m of kase?.mappings ?? []) {
-        const from = pathId(m[secondary]);
-        const to = pathId(m[primary]);
+        const from = pathId(rowPath(m[secondary]));
+        const to = pathId(rowPath(m[primary]));
         if (isConstPath(m[secondary]) && !fields.some((x) => x.pid === from)) {
           fields.push({ pid: from, label: "constant", depth: 0, type: "const", value: JSON.stringify(m.constant ?? "") });
         }
@@ -2043,6 +2175,13 @@ export default function ObjectMapper() {
   };
 
   // ---------- readiness: is this ready to hand off? ----------
+  // Output validation: the mapped result checked against the target's schema.
+  const schemaIssues = useMemo(() => {
+    const t = sides[targetSide];
+    if (t.format !== "jsonschema" || result === null || !t.text.trim()) return null;
+    return validateJsonSchema(result, t.text);
+  }, [sides, targetSide, result]);
+
   const readiness = useMemo(() => {
     const tree = lookups[targetSide];
     if (!tree || sides[sourceSide].data === null) return null;
@@ -2069,9 +2208,10 @@ export default function ObjectMapper() {
                   ),
             )
           : undefined,
+      schemaIssues: schemaIssues?.map((i) => `${i.path || "(top level)"} ${i.message}`),
       spec,
     });
-  }, [lookups, targetSide, sourceSide, sides, multi.enabled, multi.combine, liveSources, mappings, unmapped, merged, testRuns, spec, coverage, primary]);
+  }, [lookups, targetSide, sourceSide, sides, multi.enabled, multi.combine, liveSources, mappings, unmapped, merged, testRuns, spec, coverage, primary, schemaIssues]);
   const onReadinessAction = (id: string) => {
     if (id === "undecided" || id === "questions") {
       setUnmappedOpen(true);
@@ -2080,6 +2220,7 @@ export default function ObjectMapper() {
     } else if (id === "spec") setSpecOpen(true);
     else if (id === "nocase") setMultiCollapsed(false);
     else if (id === "gaps") setCanvasView(false);
+    else if (id === "schema") setCanvasView(false);
   };
 
   /** Extra values per field: only on the source in multi-source mode. */
@@ -2127,6 +2268,78 @@ export default function ObjectMapper() {
     a.download = `${fileSlug(docName)}-result${part === "example" ? "-example" : ""}.${ext}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  /** An OpenAPI document of every scenario: target schemas annotated with where each field comes from. */
+  const exportOpenApi = (format: "yaml" | "json") => {
+    const list = allScenarios.map((sc) => openApiScenarioOf(sc, spec)).filter((x): x is OpenApiScenario => x !== null);
+    if (!list.length) {
+      setNotice({ kind: "error", text: "Define a target object first: the OpenAPI export describes the target with its mappings.", details: [] });
+      return;
+    }
+    const text = buildOpenApi({ title: docName.trim() || DEFAULT_DOC_NAME, version: spec.version, description: spec.purpose, scenarios: list }, format);
+    const url = URL.createObjectURL(new Blob([text], { type: format === "json" ? "application/json" : "application/yaml" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${fileSlug(docName)}-openapi.${format}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // ---------- OpenAPI import ----------
+  const [openApiOpen, setOpenApiOpen] = useState(false);
+  /** An object defined by a schema from an API spec. */
+  const sideFromSchema = (cur: SideState, e: ApiSchemaEntry): SideState => {
+    const text = JSON.stringify(e.schema, null, 2);
+    return {
+      ...cur,
+      format: "jsonschema",
+      text,
+      data: readFormat("jsonschema", text).data,
+      error: null,
+      editingText: false,
+      name: e.kind === "component" ? e.label : `${e.group} ${e.kind === "request" ? "request" : e.status}`,
+      apiOrigin: e.method ? { method: e.method, path: e.path, status: e.status } : undefined,
+      fixed: {},
+      moreValues: {},
+      decisions: {},
+      questions: {},
+    };
+  };
+  const applyApiSchema = (e: ApiSchemaEntry, role: "source" | "target") => {
+    const side = role === "source" ? sourceSide : targetSide;
+    const next = sideFromSchema(sides[side], e);
+    setSides((s) => ({ ...s, [side]: next }));
+    commitData(side, next.data, undefined, true);
+    setOpenApiOpen(false);
+    setNotice({ kind: "ok", text: `${e.group === "Components" ? e.label : `${e.group} ${e.label}`} is now the ${role}, as a JSON Schema with an example made from it.`, details: [] });
+  };
+  /** One scenario per response: the response is the target, the current source is copied in (with its mappings where they still fit). */
+  const scenariosFromResponses = (entries: ApiSchemaEntry[]) => {
+    const src = copyObject(sides[sourceSide]);
+    const made = entries.map((e): ScenarioState => {
+      const target = sideFromSchema(emptySide(), e);
+      const valid = allPaths(buildTree(target.data!));
+      const ms = multi.enabled
+        ? []
+        : mappings
+            .map((m) => ({ ...m, left: m[sourceSide], right: m[targetSide] }))
+            .filter((m) => isHeaderPath(m.right) || valid.has(pathId(rowPath(m.right))));
+      return {
+        id: newId(),
+        name: `${e.status} ${e.label.replace(/^\S+ response:?\s*/, "")}`.trim(),
+        sides: { left: copyObject(src), right: target },
+        primary: "left",
+        mappings: ms,
+        bothEditable: false,
+        multi: emptyMulti(),
+      };
+    });
+    const empty = allScenarios.length === 1 && sides.left.data === null && sides.right.data === null;
+    const list = empty ? made : [...allScenarios, ...made];
+    loadScenario(list, made[0].id);
+    setOpenApiOpen(false);
+    setNotice({ kind: "ok", text: `Added ${made.length} scenarios, one per response: ${made.map((s) => s.name).join(", ")}.`, details: [] });
   };
 
   /** One workbook: the scenario on screen, or every scenario when there are several. */
@@ -2224,6 +2437,7 @@ export default function ObjectMapper() {
             ...(m.constant !== undefined ? { constant: m.constant } : {}),
             ...(m.db ? { db: m.db } : {}),
             ...(m.translate ? { translate: m.translate } : {}),
+            ...(m.steps?.length ? { steps: m.steps } : {}),
           }),
         ),
       }));
@@ -2326,7 +2540,7 @@ export default function ObjectMapper() {
   const mappingSpec = useMemo(() => {
     const groups = new Map<string, Mapping[]>();
     for (const m of mappings) {
-      const id = pathId(m[targetSide]);
+      const id = pathId(rowPath(m[targetSide]));
       groups.set(id, [...(groups.get(id) ?? []), m]);
     }
     return [...groups.values()].map((g) =>
@@ -2344,10 +2558,12 @@ export default function ObjectMapper() {
   const workspaceRef = useRef<HTMLDivElement>(null);
   const panelRefs = { left: useRef<HTMLDivElement>(null), right: useRef<HTMLDivElement>(null) };
   const [lines, setLines] = useState<
-    { id: string; d: string; mx: number; my: number; color: string; x2: number; y2: number; dir: Side }[]
+    { id: string; d: string; mx: number; my: number; color: string; x2: number; y2: number; dir: Side; angle: number }[]
   >([]);
   const [layoutTick, setLayoutTick] = useState(0);
   const bump = useCallback(() => setLayoutTick((t) => t + 1), []);
+  // The panels (and the lines between them) are unmounted while the canvas is shown.
+  const showingCanvas = multi.enabled && canvasView && canvas !== null;
 
   useEffect(() => {
     window.addEventListener("resize", bump);
@@ -2366,7 +2582,7 @@ export default function ObjectMapper() {
     };
     // panelRefs are stable; re-run when panels mount/unmount
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bump, sides.left.editingText, sides.right.editingText, trees.left === null, trees.right === null, search.left, search.right]);
+  }, [bump, sides.left.editingText, sides.right.editingText, trees.left === null, trees.right === null, search.left, search.right, showingCanvas, objectView.left, objectView.right]);
 
   useLayoutEffect(() => {
     const ws = workspaceRef.current;
@@ -2413,13 +2629,73 @@ export default function ObjectMapper() {
         x2: sourceSide === "left" ? x2 : x1,
         y2: sourceSide === "left" ? y2 : y1,
         dir: sourceSide === "left" ? ("right" as Side) : ("left" as Side),
+        // The curve's direction at its midpoint (degrees), pointing source → target.
+        angle: (Math.atan2(1.5 * (y2 - y1), 0.75 * (x2 - x1)) * 180) / Math.PI + (sourceSide === "left" ? 0 : 180),
       });
     }
     setLines(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mappings, trees, layoutTick, colorFor, sourceSide]);
+  }, [mappings, trees, layoutTick, colorFor, sourceSide, showingCanvas, objectView.left, objectView.right]);
 
   // ---------- render ----------
+  /** What a panel's Object view shows: the object in its own format (for the target, optionally after mapping). */
+  type Preview = { text: string; headers: string; note: string; grids?: Grid[] };
+  /**
+   * What an Object view shows: the object in its own format, or (`after`) what the mapping
+   * produces into it. Schema formats show the message they describe; tables and CSV a grid.
+   */
+  const previewOf = (
+    st: SideState,
+    role: "source" | "target",
+    after: { data: Json; headers: Headers | null; text: string | null; note: string } | null,
+  ): Preview => {
+    const data = after ? after.data : st.data;
+    const headers = after ? after.headers : activeHeaders(st);
+    if (data === null) return { text: "", headers: "", note: "" };
+    const schemaFormat = st.format === "avro" || st.format === "jsonschema";
+    const text = schemaFormat
+      ? JSON.stringify(data, null, 2)
+      : after
+        ? (after.text ?? writeFormat(st.format, data, st.layout, st.text))
+        : st.text.trim() || writeFormat(st.format, data, st.layout);
+    const headerText = headers && Object.keys(headers).length ? headersText(headers) : "";
+    const note = after
+      ? after.note
+      : schemaFormat
+        ? `An example message built from the ${formatInfo(st.format).label}.`
+        : role === "target"
+          ? "As defined (the template), before any mapping."
+          : "The object as loaded.";
+    const grids = st.format === "table" || st.format === "csv" ? gridsOf(data, st.format) : undefined;
+    return { text, headers: headerText, note, ...(grids?.length ? { grids } : {}) };
+  };
+  /** A panel's Object view. */
+  const objectPreviewOf = (side: Side): Preview =>
+    previewOf(
+      sides[side],
+      side === targetSide ? "target" : "source",
+      side === targetSide && objectAfter && result !== null
+        ? { data: result, headers: resultHeaders, text: resultText, note: `As the mapping produces it from ${multi.enabled ? `${activeSource?.name ?? "this source"}'s` : "the source's"} sample.` }
+        : null,
+    );
+  /** A canvas card's Object view (sources as loaded; the standard as merged, or as the selected source makes it). */
+  const [canvasObject, setCanvasObject] = useState<string | null>(null);
+  const canvasPreview = (id: string): (Preview & { title: string; target: boolean }) | null => {
+    if (id === "standard") {
+      const std = sides[primary];
+      const after = objectAfter
+        ? merged
+          ? { data: merged.body, headers: supportsHeaders(std.format) && Object.keys(merged.headers).length ? merged.headers : null, text: merged.text, note: "As every source merges into it, from their samples." }
+          : result !== null
+            ? { data: result, headers: resultHeaders, text: resultText, note: `As ${activeSource?.name ?? "the active source"} fills it from its sample.` }
+            : null
+        : null;
+      return { ...previewOf(std, "target", after), title: std.name?.trim() || "Standard", target: true };
+    }
+    const src = liveSources.find((x) => x.id === id);
+    return src ? { ...previewOf(src.side, "source", null), title: src.name, target: false } : null;
+  };
+
   const renderPanel = (side: Side) => {
     const state = sides[side];
     const tree = trees[side];
@@ -2488,6 +2764,28 @@ export default function ObjectMapper() {
             </select>
           </label>
           <div className="ml-auto flex gap-1">
+            {showTree && (
+              <span className="inline-flex overflow-hidden rounded-md border border-zinc-300 text-xs dark:border-zinc-700" role="group" aria-label={`${side} panel view`}>
+                {([
+                  [false, "Fields", "Map and edit field by field"],
+                  [true, "Object", "See the whole object as it looks in its format (read-only)"],
+                ] as const).map(([on, text, hint]) => (
+                  <button
+                    key={text}
+                    onClick={() => setObjectView((v) => ({ ...v, [side]: on }))}
+                    aria-pressed={objectView[side] === on}
+                    title={hint}
+                    className={`px-2 py-1 ${
+                      objectView[side] === on
+                        ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                        : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                    }`}
+                  >
+                    {text}
+                  </button>
+                ))}
+              </span>
+            )}
             {!isPrimary && (
               !multi.enabled && <HeaderButton onClick={() => setPrimary(side)}>Make primary</HeaderButton>
             )}
@@ -2534,9 +2832,12 @@ export default function ObjectMapper() {
 
         {state.format === "flat" && (
           <FlatLayoutEditor
-            key={JSON.stringify(state.layout)}
             layout={state.layout}
-            role={isPrimary ? "source" : "target"}
+            role={side === sourceSide ? "source" : "target"}
+            text={state.text}
+            data={state.data}
+            strayFields={strayFields(state.data)}
+            onMoveStray={(into) => moveIntoSection(side, into)}
             currentFields={sectionFields(state.data)}
             hasSections={SECTIONS.some((n) => sectionFields(state.data)[n].length > 0)}
             onApply={(layout) => applyLayout(side, layout)}
@@ -2544,7 +2845,7 @@ export default function ObjectMapper() {
           />
         )}
 
-        {showTree && (
+        {showTree && !objectView[side] && (
           <div className="flex items-center gap-2 border-b border-zinc-100 px-3 py-1.5 dark:border-zinc-800">
             <input
               value={search[side]}
@@ -2574,7 +2875,15 @@ export default function ObjectMapper() {
             )}
           </div>
         )}
-        {showTree ? (
+        {showTree && objectView[side] ? (
+          <ObjectPreview
+            scrollRef={panelRefs[side]}
+            {...objectPreviewOf(side)}
+            after={side === targetSide ? objectAfter : undefined}
+            onAfter={side === targetSide ? setObjectAfter : undefined}
+            onBack={() => setObjectView((v) => ({ ...v, [side]: false }))}
+          />
+        ) : showTree ? (
           <div ref={panelRefs[side]} data-drag-scroll className="max-h-[65vh] min-h-64 overflow-auto p-2">
             <div>
               {supportsHeaders(state.format) && (
@@ -2611,6 +2920,7 @@ export default function ObjectMapper() {
                 root={tree as FieldNode}
                 side={side}
                 editable={!isPrimary || bothEditable}
+                movable={state.format === "flat"}
                 selectedId={selected?.side === side ? pathId(selected.path) : null}
                 mappedColors={mappedColors[side]}
                 suggestion={isPrimary ? null : suggestion}
@@ -2748,6 +3058,8 @@ export default function ObjectMapper() {
             onExport={exportExcel}
             exportDisabled={sides.left.data === null && sides.right.data === null}
             onImport={() => fileInputRef.current?.click()}
+            onImportOpenApi={() => setOpenApiOpen(true)}
+            onExportOpenApi={exportOpenApi}
             onLoadExample={loadExample}
             onClear={resetAll}
           />
@@ -2925,8 +3237,8 @@ export default function ObjectMapper() {
             const kase = src?.cases.find((c) => c.id === caseId);
             if (!src || !kase) return;
             const m = { id: newId(), ...(primary === "left" ? { left: to, right: from } : { left: from, right: to }) } as Mapping;
-            const replaced = kase.mappings.filter((x) => pathId(x[primary]) === toPid);
-            const edit = (ms: Mapping[]) => [...ms.filter((x) => pathId(x[primary]) !== toPid), m];
+            const replaced = kase.mappings.filter((x) => pathId(rowPath(x[primary])) === toPid);
+            const edit = (ms: Mapping[]) => [...ms.filter((x) => pathId(rowPath(x[primary])) !== toPid), m];
             if (sourceId === multi.activeSource && caseId === src.activeCase) setMappings(edit);
             else
               setMulti((mm) => ({
@@ -2943,6 +3255,7 @@ export default function ObjectMapper() {
               details: [],
             });
           }}
+          onShowObject={setCanvasObject}
           positions={multi.canvas ?? {}}
           onMove={(id, p) => setMulti((m) => ({ ...m, canvas: { ...(m.canvas ?? {}), [id]: p } }))}
           onOpen={(id) => {
@@ -2953,9 +3266,70 @@ export default function ObjectMapper() {
       ) : (
       <div ref={workspaceRef} className="relative grid grid-cols-1 gap-4 lg:grid-cols-[1fr_72px_1fr] lg:gap-0">
         {renderPanel("left")}
-        <div className="hidden items-start justify-center pt-3 text-xl text-zinc-400 lg:flex" aria-hidden>
-          {sourceSide === "left" ? "→" : "←"}
-        </div>
+        {(() => {
+          // Which way values flow: a clear badge between the panels (it stays in view while scrolling).
+          const role = (side: Side) => (side === sourceSide ? "source" : multi.enabled ? "standard" : "target");
+          const name = (side: Side) => sides[side].name?.trim() || role(side);
+          const flow = `Values flow from ${name(sourceSide)} (${role(sourceSide)}) into ${name(targetSide)} (${role(targetSide)})`;
+          const arrow = (
+            <svg viewBox="0 0 24 24" className={`h-6 w-6 ${sourceSide === "left" ? "" : "rotate-180"}`} fill="none" stroke="currentColor" strokeWidth={2.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M4 12h15M13 6l6 6-6 6" />
+            </svg>
+          );
+          return (
+            <>
+              <div className="hidden justify-center pt-2 lg:flex">
+                <div className="sticky top-3 flex h-fit flex-col items-center gap-1 text-center">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">maps</span>
+                  {/* Clicking swaps the direction (not in multi-source mode: the standard must stay the primary). */}
+                  <button
+                    onClick={() =>
+                      multi.enabled
+                        ? setNotice({
+                            kind: "error",
+                            text: "In multi-source mode the direction is fixed: every source maps into the standard. To map the other way, turn off Multi-source mode (☰ Menu → Workspace) and swap there.",
+                            details: [],
+                          })
+                        : setPrimary(secondary)
+                    }
+                    aria-disabled={multi.enabled}
+                    aria-label={multi.enabled ? `${flow}. Direction is fixed in multi-source mode` : `${flow}. Click to swap direction`}
+                    title={multi.enabled ? `${flow}. Fixed in multi-source mode: sources always map into the standard.` : `${flow}. Click to swap direction.`}
+                    className={`group relative flex h-11 w-11 items-center justify-center rounded-full text-white shadow-md ring-4 transition focus-visible:outline-none focus-visible:ring-blue-400 ${
+                      multi.enabled
+                        ? "cursor-help bg-zinc-400 ring-zinc-100 dark:bg-zinc-600 dark:ring-zinc-800"
+                        : "bg-blue-600 ring-blue-100 hover:bg-blue-700 hover:ring-blue-200 dark:ring-blue-950 dark:hover:ring-blue-900"
+                    }`}
+                  >
+                    <span className={`transition-transform duration-200 ${multi.enabled ? "" : "group-hover:scale-110"}`}>{arrow}</span>
+                    {multi.enabled && (
+                      <svg viewBox="0 0 16 16" className="absolute -bottom-1 -right-1 h-4 w-4 rounded-full bg-white p-0.5 text-zinc-600 shadow dark:bg-zinc-900 dark:text-zinc-300" fill="currentColor" aria-hidden>
+                        <path d="M5 7V5a3 3 0 1 1 6 0v2h.5A1.5 1.5 0 0 1 13 8.5v5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 3 13.5v-5A1.5 1.5 0 0 1 4.5 7H5Zm1.5 0h3V5a1.5 1.5 0 0 0-3 0v2Z" />
+                      </svg>
+                    )}
+                  </button>
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">into</span>
+                  <span className="text-[9px] text-zinc-400">{multi.enabled ? "fixed" : "click to swap"}</span>
+                </div>
+              </div>
+              {/* Stacked panels (narrow screens): the left panel is on top. */}
+              <div role="img" aria-label={flow} className="-my-2 flex items-center justify-center gap-2 text-xs font-medium text-zinc-500 lg:hidden">
+                <button
+                  onClick={() => setPrimary(secondary)}
+                  disabled={multi.enabled}
+                  aria-label="Swap direction"
+                  title={multi.enabled ? "Fixed in multi-source mode" : "Swap direction"}
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-white shadow hover:bg-blue-700 disabled:bg-zinc-400 disabled:hover:bg-zinc-400"
+                >
+                  <svg viewBox="0 0 24 24" className={`h-5 w-5 ${sourceSide === "left" ? "" : "rotate-180"}`} fill="none" stroke="currentColor" strokeWidth={2.75} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <path d="M12 4v15M6 13l6 6 6-6" />
+                  </svg>
+                </button>
+                {sourceSide === "left" ? `${name("left")} maps into ${name("right")}` : `${name("right")} (below) maps into ${name("left")}`}
+              </div>
+            </>
+          );
+        })()}
         {renderPanel("right")}
         <svg className="pointer-events-none absolute inset-0 hidden h-full w-full overflow-visible lg:block">
           {lines.map((l) => {
@@ -2976,17 +3350,29 @@ export default function ObjectMapper() {
                   strokeWidth={active ? 3.5 : 2}
                   strokeOpacity={dimmed ? 0.12 : 0.85}
                 />
+                {/* A solid arrowhead at the target end… */}
                 <path
                   d={
                     l.dir === "right"
-                      ? `M ${l.x2 - 7} ${l.y2 - 4} L ${l.x2} ${l.y2} L ${l.x2 - 7} ${l.y2 + 4}`
-                      : `M ${l.x2 + 7} ${l.y2 - 4} L ${l.x2} ${l.y2} L ${l.x2 + 7} ${l.y2 + 4}`
+                      ? `M ${l.x2 - 12} ${l.y2 - 6.5} L ${l.x2} ${l.y2} L ${l.x2 - 12} ${l.y2 + 6.5} Z`
+                      : `M ${l.x2 + 12} ${l.y2 - 6.5} L ${l.x2} ${l.y2} L ${l.x2 + 12} ${l.y2 + 6.5} Z`
                   }
-                  fill="none"
-                  stroke={l.color}
-                  strokeOpacity={dimmed ? 0.12 : 1}
-                  strokeWidth={2}
+                  fill={l.color}
+                  fillOpacity={dimmed ? 0.12 : 1}
                 />
+                {/* …and a chevron mid-line, so the direction reads along the whole line. */}
+                {!(active && hover?.via === "line") && (
+                  <path
+                    d="M -5 -5.5 L 2.5 0 L -5 5.5"
+                    transform={`translate(${l.mx} ${l.my}) rotate(${l.angle})`}
+                    fill="none"
+                    stroke={l.color}
+                    strokeOpacity={dimmed ? 0.12 : 1}
+                    strokeWidth={2.5}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                )}
                 {active && hover?.via === "line" && (
                   <g
                     role="button"
@@ -3068,6 +3454,7 @@ export default function ObjectMapper() {
         }
         resultText={resultText}
         resultFormat={sides[targetSide].format}
+        schemaIssues={schemaIssues}
         onDownload={() => downloadResult(sides[targetSide].format === "avro" ? "schema" : "all")}
         onDownloadExample={sides[targetSide].format === "avro" ? () => downloadResult("example") : undefined}
         hoveredIds={hoveredIds}
@@ -3076,6 +3463,8 @@ export default function ObjectMapper() {
         onAddConstant={addConstant}
         onSetConstant={setConstant}
         onSetTranslate={setTranslate}
+        onSetSteps={setSteps}
+        onSetFrom={(id, path) => setMappings((ms) => ms.map((m) => (m.id === id ? { ...m, [sourceSide]: path } : m)))}
         onSetNote={setNote}
         sampleValuesFor={sampleValuesFor}
         onSetJoin={setJoin}
@@ -3093,7 +3482,7 @@ export default function ObjectMapper() {
             <code className="font-semibold">{pathLabel(pendingCombine[targetSide])}</code> already gets{" "}
             <code>
               {mappings
-                .filter((m) => pathId(m[targetSide]) === pathId(pendingCombine[targetSide]))
+                .filter((m) => pathId(rowPath(m[targetSide])) === pathId(pendingCombine[targetSide]))
                 .map((m) => sourceLabel(m, sourceSide))
                 .join(" + ")}
             </code>
@@ -3134,6 +3523,44 @@ export default function ObjectMapper() {
       )}
 
       {specOpen && <SpecDialog spec={spec} onChange={setSpec} onClose={() => setSpecOpen(false)} />}
+      {canvasObject && (() => {
+        const p = canvasPreview(canvasObject);
+        if (!p) return null;
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setCanvasObject(null)}>
+            <div
+              role="dialog"
+              aria-label={`${p.title} object`}
+              onClick={(e) => e.stopPropagation()}
+              className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            >
+              <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                <h2 className="text-sm font-semibold">{p.title}</h2>
+                <button onClick={() => setCanvasObject(null)} aria-label="Close" className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100">
+                  ✕
+                </button>
+              </div>
+              <ObjectPreview
+                scrollRef={{ current: null }}
+                {...p}
+                after={p.target ? objectAfter : undefined}
+                onAfter={p.target ? setObjectAfter : undefined}
+                onBack={() => setCanvasObject(null)}
+                backLabel="Close"
+              />
+            </div>
+          </div>
+        );
+      })()}
+      {openApiOpen && (
+        <OpenApiDialog
+          onClose={() => setOpenApiOpen(false)}
+          onUse={applyApiSchema}
+          onScenarios={scenariosFromResponses}
+          sourceLabel="Source"
+          targetLabel={multi.enabled ? "Standard" : "Target"}
+        />
+      )}
       {scenarioUndo && (
         <div
           role="status"
@@ -3292,6 +3719,53 @@ function CoverageTable({
 }
 
 /** Every source's sample run through the case that matches it, side by side. */
+/** Which item(s) of a source list a mapping reads: every item, the first, the last, item #n, or the first where a field matches. */
+function ItemPicker({ list, seg, onChange }: { list: string; seg: string; onChange: (seg: string) => void }) {
+  const body = seg === "[]" ? "" : seg.slice(1, -1);
+  const kind = seg === "[]" ? "each" : body === "first" ? "first" : body === "last" ? "last" : body.startsWith("#") ? "nth" : "where";
+  const field = "rounded border border-zinc-300 bg-white px-1 py-0 text-[11px] outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-900";
+  return (
+    <span className="inline-flex items-center gap-1 font-sans text-[11px] text-zinc-500" onClick={(e) => e.stopPropagation()}>
+      {list}:
+      <select
+        value={kind}
+        onChange={(e) => {
+          const k = e.target.value;
+          onChange(k === "each" ? "[]" : k === "first" ? "[first]" : k === "last" ? "[last]" : k === "nth" ? "[#1]" : "[where type = ]");
+        }}
+        aria-label={`Which items of ${list}`}
+        className={field}
+      >
+        <option value="each">each item</option>
+        <option value="first">first item</option>
+        <option value="last">last item</option>
+        <option value="nth">item #…</option>
+        <option value="where">first item where…</option>
+      </select>
+      {kind === "nth" && (
+        <input
+          type="number"
+          min={1}
+          value={body.slice(1)}
+          onChange={(e) => onChange(`[#${Math.max(1, Number(e.target.value) || 1)}]`)}
+          aria-label="Item number"
+          className={`${field} w-12`}
+        />
+      )}
+      {kind === "where" && (
+        <input
+          value={body.replace(/^where\s*/, "")}
+          onChange={(e) => onChange(`[where ${e.target.value}]`)}
+          placeholder="type = billing"
+          title='A field of the item, then = (equals), != (differs) or ~ (contains), then a value'
+          aria-label="Item condition"
+          className={`${field} w-36 font-mono`}
+        />
+      )}
+    </span>
+  );
+}
+
 /** Coverage, examples and "test all" in one tab, with a switch between them. */
 function SourcesTab({ views }: { views: { id: string; label: string; content: React.ReactNode }[] }) {
   const [view, setView] = useState(views[0].id);
@@ -3457,7 +3931,7 @@ function specExtras(m: Mapping): { constant?: Json; translate?: Translation } {
 function groupByTarget(mappings: Mapping[], targetSide: Side): Mapping[][] {
   const groups = new Map<string, Mapping[]>();
   for (const m of mappings) {
-    const id = pathId(m[targetSide]);
+    const id = pathId(rowPath(m[targetSide]));
     groups.set(id, [...(groups.get(id) ?? []), m]);
   }
   return [...groups.values()];
@@ -3544,6 +4018,7 @@ function OutputPanel({
   extraTabs,
   resultText,
   resultFormat,
+  schemaIssues,
   onDownload,
   onDownloadExample,
   hoveredIds,
@@ -3554,6 +4029,8 @@ function OutputPanel({
   onAddConstant,
   onSetConstant,
   onSetTranslate,
+  onSetSteps,
+  onSetFrom,
   onSetNote,
   sampleValuesFor,
   onClear,
@@ -3572,6 +4049,8 @@ function OutputPanel({
   /** The mapped result written in the target's file format. */
   resultText: string | null;
   resultFormat: Format;
+  /** Problems with the result against the target's JSON Schema (null: no schema to check). */
+  schemaIssues: { path: string; message: string }[] | null;
   onDownload: () => void;
   /** An Avro result: download the example message on its own. */
   onDownloadExample?: () => void;
@@ -3584,12 +4063,16 @@ function OutputPanel({
   onSetConstant: (id: string, constant: { value: Json; db?: DbRef }) => void;
   onSetTranslate: (id: string, t: Translation | undefined) => void;
   onSetNote: (id: string, note: string) => void;
+  onSetSteps: (id: string, steps: Step[]) => void;
+  /** Change a mapping's source path (e.g. pick one item of a list). */
+  onSetFrom: (id: string, path: Path) => void;
   sampleValuesFor: (m: Mapping) => string[];
   onClear: () => void;
 }) {
   const [tab, setTab] = useState<Tab | string>("mappings");
   const [addingConstant, setAddingConstant] = useState(false);
   const [translating, setTranslating] = useState<string | null>(null);
+  const [stepping, setStepping] = useState<string | null>(null);
   const [noting, setNoting] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [collapsed, toggleCollapsed] = useStoredFlag(OUTPUT_COLLAPSED_KEY);
@@ -3740,11 +4223,22 @@ function OutputPanel({
                       ) : (
                         <>
                           <span>{pathLabel(from)}</span>
+                          {/* Lists in the source: every item, or pick one (first, last, #n, where …). */}
+                          {from.map((seg, i) =>
+                            seg === "[]" || isSelector(seg) ? (
+                              <ItemPicker
+                                key={i}
+                                list={String(from[i - 1] ?? "list")}
+                                seg={seg}
+                                onChange={(next) => onSetFrom(m.id, from.map((x, j) => (j === i ? next : x)))}
+                              />
+                            ) : null,
+                          )}
                         </>
                       )}
                       {group.length === 1 && (
                         <>
-                          <span className="text-zinc-400">→</span>
+                          <span className="px-0.5 text-base font-bold leading-none text-blue-600 dark:text-blue-400" aria-label="maps into">→</span>
                           <span>{pathLabel(to)}</span>
                         </>
                       )}
@@ -3756,6 +4250,14 @@ function OutputPanel({
                           {fromType} → {toType}
                         </span>
                       )}
+                      {m.steps?.length ? (
+                        <span
+                          className="truncate rounded bg-sky-100 px-1.5 font-sans text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300"
+                          title={describeSteps(m.steps)}
+                        >
+                          ƒ {describeSteps(m.steps)}
+                        </span>
+                      ) : null}
                       {m.translate && (
                         <span
                           className="truncate rounded bg-violet-100 px-1.5 font-sans text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300"
@@ -3767,9 +4269,20 @@ function OutputPanel({
                       )}
                       <span
                         className={`ml-auto flex items-center gap-1 transition-opacity ${
-                          translating === m.id || noting === m.id ? "" : "opacity-0 focus-within:opacity-100 group-hover:opacity-100"
+                          translating === m.id || noting === m.id || stepping === m.id ? "" : "opacity-0 focus-within:opacity-100 group-hover:opacity-100"
                         }`}
                       >
+                        <button
+                          onClick={() => setStepping((t) => (t === m.id ? null : m.id))}
+                          className={`rounded-md px-2 py-0.5 font-sans text-xs ${
+                            stepping === m.id
+                              ? "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300"
+                              : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                          }`}
+                          title="Transform the value: dates, text, numbers, defaults, if/then/else"
+                        >
+                          ƒ Transform
+                        </button>
                         {!isConst && (
                           <button
                             onClick={() => setTranslating((t) => (t === m.id ? null : m.id))}
@@ -3838,6 +4351,16 @@ function OutputPanel({
                         )}
                       </li>
                     )}
+                    {stepping === m.id && (
+                      <li>
+                        <StepsEditor
+                          steps={m.steps ?? []}
+                          sample={isConst ? (m.constant ?? "") : sampleValuesFor(m).map((v) => inferScalar(v))[0]}
+                          onChange={(steps) => onSetSteps(m.id, steps)}
+                          onClose={() => setStepping(null)}
+                        />
+                      </li>
+                    )}
                     {translating === m.id && (
                       <li>
                         <TranslationEditor
@@ -3870,6 +4393,34 @@ function OutputPanel({
                         </span>
                       )}
                       <span className="ml-auto flex flex-wrap items-center gap-1 text-xs text-zinc-500">
+                        {/* First the result type, then how the parts make it. */}
+                        result
+                        <select
+                          value={isNumericCombine(join) ? "number" : "text"}
+                          onChange={(e) => onSetJoin(targetId, e.target.value === "number" ? "[sum]" : " ")}
+                          aria-label={`Result type of ${pathLabel(to)}`}
+                          className="rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs text-zinc-800 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                        >
+                          <option value="text">Text</option>
+                          <option value="number">Number</option>
+                        </select>
+                        {isNumericCombine(join) && (
+                          <select
+                            value={join}
+                            onChange={(e) => onSetJoin(targetId, e.target.value)}
+                            aria-label={`How to work out ${pathLabel(to)}`}
+                            className="rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs text-zinc-800 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-200"
+                          >
+                            {COMBINE_MODES.filter((c) => c.id !== "join").map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.label}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        {join === "[decimal]" && <span title="Reorder the parts with ↑ ↓">first = amount, second = decimal places</span>}
+                        {!isNumericCombine(join) && (
+                        <>
                         joined with
                         <input
                           value={join}
@@ -3896,8 +4447,56 @@ function OutputPanel({
                             {label}
                           </button>
                         ))}
+                        </>
+                        )}
                       </span>
                     </div>
+                    {(() => {
+                      // Each part's type and a sample value.
+                      const parts = group.map((m) => {
+                        const isConst = isConstPath(m[primary]);
+                        const sampleText = isConst ? undefined : sampleValuesFor(m)[0];
+                        const value: Json | undefined = isConst ? (m.constant ?? "") : sampleText === undefined ? undefined : inferScalar(sampleText);
+                        const type = isConst ? typeof (m.constant ?? "") : primaryTree ? findNode(primaryTree, rowPath(m[primary]))?.type : undefined;
+                        return { value, type };
+                      });
+                      const types = new Set(parts.map((p) => p.type).filter(Boolean));
+                      const resultIsNumber = isNumericCombine(join);
+                      const targetMismatch = !!toType && ((toType === "number" && !resultIsNumber) || (toType === "string" && resultIsNumber));
+                      if (types.size < 2 && !targetMismatch) return null;
+                      const options: [string, string][] = [
+                        [isNumericCombine(join) ? " " : join, "Text"],
+                        ["[sum]", "Sum"],
+                        ["[product]", "Multiply"],
+                        ["[decimal]", "Decimal places"],
+                      ];
+                      return (
+                        <div className="flex flex-wrap items-center gap-1.5 px-2 pb-1.5 text-xs text-zinc-500">
+                          <span>
+                            {types.size > 1 ? `The parts are different types (${[...types].join(" + ")}).` : ""}
+                            {targetMismatch ? ` The target field is ${toType === "number" ? "a number" : "text"}.` : ""} With your samples:
+                          </span>
+                          {options.map(([mode, label]) => {
+                            const example = combineParts(parts.map((p) => p.value), mode);
+                            const current = mode === join || (label === "Text" && !isNumericCombine(join));
+                            return (
+                              <button
+                                key={label}
+                                onClick={() => onSetJoin(targetId, mode)}
+                                className={`rounded border px-1.5 py-0.5 font-mono ${
+                                  current
+                                    ? "border-blue-500 bg-blue-50 text-blue-900 dark:bg-blue-950/60 dark:text-blue-100"
+                                    : "border-zinc-200 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                                }`}
+                                title={`Use: ${label}`}
+                              >
+                                <span className="font-sans text-zinc-500">{label}</span> {JSON.stringify(example)}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                     <ul className="flex flex-col">{group.map(row)}</ul>
                   </li>
                 );
@@ -3924,6 +4523,34 @@ function OutputPanel({
             {texts[tab as Exclude<Tab, "mappings">] ?? "Load both objects to see the mapped result."}
           </pre>
         )}
+        {tab === "result" && result !== null && schemaIssues && (
+          <div
+            role="status"
+            className={`mt-2 rounded border px-2 py-1.5 text-xs ${
+              schemaIssues.length
+                ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+                : "border-green-300 bg-green-50 text-green-900 dark:border-green-800 dark:bg-green-950/40 dark:text-green-200"
+            }`}
+          >
+            {schemaIssues.length === 0 ? (
+              "✓ The result is valid against the target's JSON Schema."
+            ) : (
+              <>
+                <p className="font-medium">
+                  ⚠ The result doesn&apos;t match the target&apos;s JSON Schema ({schemaIssues.length} problem{schemaIssues.length === 1 ? "" : "s"}):
+                </p>
+                <ul className="mt-1 list-disc pl-4">
+                  {schemaIssues.slice(0, 12).map((i, n) => (
+                    <li key={n}>
+                      <code>{i.path || "(top level)"}</code> {i.message}
+                    </li>
+                  ))}
+                  {schemaIssues.length > 12 && <li>…and {schemaIssues.length - 12} more</li>}
+                </ul>
+              </>
+            )}
+          </div>
+        )}
         {tab === "result" && result !== null && (
           <p className="mt-2 text-xs text-zinc-500">
             The {secondary} object with every mapped field filled from the {primary} object. Fields with no
@@ -3939,4 +4566,146 @@ function OutputPanel({
       </div>
     </section>
   );
+}
+
+/** A panel's Object view: the whole object, read-only, with a copy button. */
+function ObjectPreview({
+  scrollRef,
+  text,
+  headers,
+  note,
+  after,
+  onAfter,
+  onBack,
+  grids,
+  backLabel = "Back to fields",
+}: {
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  text: string;
+  headers: string;
+  note: string;
+  /** Row formats: the rows as tables. */
+  grids?: Grid[];
+  backLabel?: string;
+  /** Target only: showing the mapped result (true) or the template (false). */
+  after?: boolean;
+  onAfter?: (on: boolean) => void;
+  onBack: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [asText, setAsText] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(headers ? `${headers}\n\n${text}` : text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // clipboard unavailable
+    }
+  };
+  return (
+    <div className="flex flex-col">
+      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-100 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-800">
+        {onAfter && (
+          <span className="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="Target object view">
+            {([
+              [false, "Template"],
+              [true, "After mapping"],
+            ] as const).map(([on, label]) => (
+              <button
+                key={label}
+                onClick={() => onAfter(on)}
+                aria-pressed={after === on}
+                className={`px-2 py-0.5 ${after === on ? "bg-blue-600 text-white" : "hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        )}
+        <span className="min-w-0 flex-1">{note}</span>
+        {grids && <HeaderButton onClick={() => setAsText(!asText)}>{asText ? "Show as grid" : "Show as text"}</HeaderButton>}
+        <HeaderButton onClick={copy}>{copied ? "Copied!" : "Copy"}</HeaderButton>
+        <HeaderButton onClick={onBack}>{backLabel}</HeaderButton>
+      </div>
+      <div ref={scrollRef} className="max-h-[65vh] min-h-64 overflow-auto p-3">
+        {headers && (
+          <>
+            <p className="mb-1 font-sans text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Headers</p>
+            <pre className="mb-3 whitespace-pre-wrap break-all rounded-md border border-dashed border-zinc-300 bg-zinc-50/60 p-2 font-mono text-xs dark:border-zinc-700 dark:bg-zinc-950/30">
+              {headers}
+            </pre>
+            <p className="mb-1 font-sans text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Body</p>
+          </>
+        )}
+        {grids && !asText ? (
+          <div className="flex flex-col gap-4">
+            {grids.map((g) => (
+              <div key={g.name}>
+                {g.name && <p className="mb-1 font-mono text-xs font-semibold text-zinc-700 dark:text-zinc-300">{g.name}</p>}
+                <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
+                  <table aria-label={`Rows of ${g.name || "the object"}`} className="w-full border-collapse font-mono text-xs">
+                    <thead className="bg-zinc-50 text-left dark:bg-zinc-950">
+                      <tr>
+                        {g.columns.map((c) => (
+                          <th key={c} className="whitespace-nowrap border-b border-zinc-200 px-2 py-1 font-semibold dark:border-zinc-800">
+                            {c}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.rows.map((row, i) => (
+                        <tr key={i} className="odd:bg-white even:bg-zinc-50/60 dark:odd:bg-zinc-900 dark:even:bg-zinc-950/40">
+                          {g.columns.map((c) => (
+                            <td key={c} className={`whitespace-nowrap border-b border-zinc-100 px-2 py-1 dark:border-zinc-800 ${row[c] === "NULL" ? "italic text-zinc-400" : ""}`}>
+                              {row[c] ?? ""}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="mt-1 text-[11px] text-zinc-500">{g.rows.length} row{g.rows.length === 1 ? "" : "s"}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <pre aria-label="Object preview" className="whitespace-pre-wrap break-all font-mono text-xs text-zinc-800 dark:text-zinc-200">
+            {text || "Nothing to show yet."}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface Grid {
+  name: string;
+  columns: string[];
+  rows: Record<string, string>[];
+}
+
+/** One row as column -> cell text; nested objects become dotted columns. */
+function flatRow(value: Json, prefix = "", out: Record<string, string> = {}): Record<string, string> {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    for (const [k, v] of Object.entries(value)) flatRow(v, prefix ? `${prefix}.${k}` : k, out);
+  } else {
+    out[prefix || "value"] = value === null ? "NULL" : typeof value === "object" ? JSON.stringify(value) : String(value);
+  }
+  return out;
+}
+
+/** Rows to show as grids: one per table (table format), or the CSV's rows. */
+function gridsOf(data: Json, format: Format): Grid[] {
+  const grid = (name: string, value: Json): Grid => {
+    const rows = (Array.isArray(value) ? value : [value]).map((r) => flatRow(r));
+    const columns = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    return { name, columns, rows };
+  };
+  if (format === "table" && data !== null && typeof data === "object" && !Array.isArray(data)) {
+    return Object.entries(data).map(([name, v]) => grid(name, v));
+  }
+  return [grid("", data)];
 }

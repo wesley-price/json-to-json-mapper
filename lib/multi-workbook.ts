@@ -18,7 +18,7 @@
 
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
 import { type Headers, HEADERS, lookupTree, supportsHeaders } from "./headers";
-import { type Json, type Path, allPaths, buildTree, findNode, flatten, parsePathLabel, pathId, pathLabel } from "./json-tree";
+import { type Json, type Path, allPaths, buildTree, findNode, flatten, parsePathLabel, pathId, pathLabel, rowPath } from "./json-tree";
 import { type Condition, describeConditions } from "./multi";
 import { type DbRef, type FixedValues, type Translation, formatDbRef, isConstPath, newConstPath, parseDbRef } from "./transforms";
 import { fixedCell, flatRow, flatSheet, readFixedCell, readFlatSheet, toJson } from "./workbook";
@@ -49,6 +49,7 @@ export interface MultiDocMapping {
   db?: DbRef;
   translate?: Translation;
   note?: string;
+  steps?: import("./steps").Step[];
 }
 
 export interface MultiDoc {
@@ -220,6 +221,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
         "Translation",
         "Constant from database",
         "Notes",
+        "Steps",
       ],
       ...doc.sources.flatMap((s, i) => {
         const srcTree = fieldsOf(s.side);
@@ -239,6 +241,7 @@ export function buildMultiWorkbook(doc: MultiDoc, extras: MultiExtras = {}): She
               m.translate ? JSON.stringify(m.translate) : "",
               m.db ? formatDbRef(m.db) : "",
               m.note ?? "",
+              m.steps?.length ? JSON.stringify(m.steps) : "",
             ];
           }),
         );
@@ -344,7 +347,7 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
       return seg;
     });
   (byName("Mappings")?.rows.slice(1) ?? []).forEach((row, i) => {
-    const [srcNo, caseNo, fromCell, toCell, , , join, constantCell, translationCell, dbCell, noteCell] = row;
+    const [srcNo, caseNo, fromCell, toCell, , , join, constantCell, translationCell, dbCell, noteCell, stepsCell] = row;
     if (fromCell === null && toCell === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -356,7 +359,7 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
       const isConst = String(fromCell ?? "").trim() === CONSTANT_SOURCE;
       const from = isConst ? newConstPath() : toPath(fromCell);
       const to = toPath(toCell);
-      if (!isConst && !srcFields[si].has(pathId(from))) throw new Error(`"${pathLabel(from)}" isn't a field of ${src.name}`);
+      if (!isConst && !srcFields[si].has(pathId(rowPath(from)))) throw new Error(`"${pathLabel(from)}" isn't a field of ${src.name}`);
       if (!stdFields.has(pathId(to))) throw new Error(`"${pathLabel(to)}" isn't a field of the standard`);
       const m: MultiDocMapping = { from, to };
       if (join !== null && join !== undefined && join !== "") m.join = String(join);
@@ -372,6 +375,14 @@ export function parseMultiWorkbook(sheets: Sheet[]): { doc: MultiDoc; warnings: 
         }
       }
       if (noteCell !== null && noteCell !== undefined && String(noteCell).trim()) m.note = String(noteCell);
+      if (stepsCell !== null && stepsCell !== undefined && String(stepsCell).trim()) {
+        try {
+          const parsed = JSON.parse(String(stepsCell));
+          if (Array.isArray(parsed)) m.steps = parsed;
+        } catch {
+          warnings.push(`${where}: the Steps column couldn't be read, so it was left out.`);
+        }
+      }
       kase.mappings.push(m);
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);

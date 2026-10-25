@@ -24,6 +24,7 @@ import {
   parsePathLabel,
   pathId,
   pathLabel,
+  rowPath,
   unflatten,
 } from "./json-tree";
 import { type FlatLayout, type Format, FORMATS, defaultFlatLayout } from "./formats";
@@ -150,7 +151,7 @@ export function buildWorkbook(opts: {
     {
       name: "Mappings",
       rows: [
-        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with", "Constant value", "Translation", "Constant from database", "Notes"],
+        ["#", `Source (${primary})`, `Target (${secondary})`, "Source type", "Target type", "Join with", "Constant value", "Translation", "Constant from database", "Notes", "Steps"],
         ...mappings.map((m, i): Cell[] => [
           i + 1,
           isConstPath(m[primary]) ? CONSTANT_SOURCE : pathLabel(m[primary]),
@@ -163,6 +164,7 @@ export function buildWorkbook(opts: {
           m.translate ? JSON.stringify(m.translate) : "",
           m.db ? formatDbRef(m.db) : "",
           m.note ?? "",
+          m.steps?.length ? JSON.stringify(m.steps) : "",
         ]),
       ],
     },
@@ -297,7 +299,7 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
   const seenPairs = new Set<string>();
 
   mappingSheet.rows.slice(1).forEach((row, i) => {
-    const [, from, to, , , join, constantCell, translationCell, dbCell, noteCell] = row;
+    const [, from, to, , , join, constantCell, translationCell, dbCell, noteCell, stepsCell] = row;
     if (from === null && to === null) return;
     const where = `Mappings row ${i + 2}`;
     try {
@@ -310,7 +312,7 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
       const src = isConstant ? newConstPath() : toPath(from);
       const dst = toPath(to);
       if (!src.length || !dst.length) throw new Error("source and target are both required");
-      if (!isConstant && !valid[primary].has(pathId(src))) throw new Error(`"${pathLabel(src)}" isn't a field in ${primarySheet.name}`);
+      if (!isConstant && !valid[primary].has(pathId(rowPath(src)))) throw new Error(`"${pathLabel(src)}" isn't a field in ${primarySheet.name}`);
       if (!valid[secondary].has(pathId(dst))) throw new Error(`"${pathLabel(dst)}" isn't a field in ${targetSheet.name}`);
       const pair = pathId(src) + pathId(dst);
       if (seenPairs.has(pair)) throw new Error(`"${pathLabel(src)}" -> "${pathLabel(dst)}" is listed twice; kept the first`);
@@ -333,7 +335,16 @@ export function parseWorkbook(sheets: Sheet[]): ImportedWorkbook {
         }
       }
       const note = noteCell !== null && noteCell !== undefined && String(noteCell).trim() ? { note: String(noteCell) } : {};
-      const extra = { ...sep, ...constant, ...translate, ...note };
+      let steps = {};
+      if (stepsCell !== null && stepsCell !== undefined && String(stepsCell).trim()) {
+        try {
+          const parsed = JSON.parse(String(stepsCell));
+          if (Array.isArray(parsed)) steps = { steps: parsed };
+        } catch {
+          warnings.push(`${where}: the Steps column couldn't be read, so it was left out`);
+        }
+      }
+      const extra = { ...sep, ...constant, ...translate, ...note, ...steps };
       mappings.push(primary === "left" ? { left: src, right: dst, ...extra } : { left: dst, right: src, ...extra });
     } catch (e) {
       warnings.push(`${where}: ${(e as Error).message}`);
